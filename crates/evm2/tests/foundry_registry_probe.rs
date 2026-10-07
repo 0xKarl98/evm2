@@ -162,6 +162,14 @@ impl SavedState {
     fn storage(&self, db: BackingDb, address: Address, key: Word) -> Word {
         self.clone().load(db).storage_slot_untracked(&address, &key).unwrap()
     }
+
+    /// Captures what [`Self::save`] keeps besides the cache, leaving `state` live.
+    fn rest_of(state: &mut State<'_>) -> StateSnapshot {
+        let cache = mem::take(&mut state.overlay_db_mut().cache);
+        let rest = state.snapshot();
+        state.overlay_db_mut().cache = cache;
+        rest
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -171,11 +179,13 @@ struct ForkEntry {
     saved: Option<SavedState>,
 }
 
+/// Like Foundry's, a snapshot covers only the fork it was taken on.
 #[derive(Clone, Debug)]
 struct RegistrySnapshot {
     active: usize,
     active_state: StateSnapshot,
-    saved: Vec<Option<SavedState>>,
+    /// [`Cheats::selected`] when the snapshot was taken.
+    selected: StateSnapshot,
 }
 
 /// What remains of Foundry's backend: no cache layer of its own.
@@ -200,6 +210,10 @@ struct Cheats {
     speculative: bool,
     /// The fork active when the call started.
     start_fork: usize,
+    /// The active fork's transaction layer, journal, and logs as it was selected, or as the call
+    /// started. Foundry stores this with the fork as its `journaled_state`. A snapshot restore
+    /// that leaves the fork puts it back, so only the fork's writes since are dropped.
+    selected: StateSnapshot,
     /// Registry captured before the first mutation of a speculative call.
     captured: Option<Registry>,
     /// Whether to also capture the start fork's accepted overlay. The issue only names the
@@ -243,7 +257,7 @@ impl Cheats {
                 let snapshot = RegistrySnapshot {
                     active: self.registry.active,
                     active_state: evm.state().snapshot(),
-                    saved: self.registry.forks.iter().map(|fork| fork.saved.clone()).collect(),
+                    selected: self.selected.clone(),
                 };
                 self.registry.snapshots.push(snapshot);
                 Some(Bytes::new())
@@ -286,7 +300,8 @@ impl Cheats {
     /// Saves the active fork and loads `fork` into the running `Evm`.
     ///
     /// Persistent accounts follow the switch with both layers, as in Foundry's
-    /// `merge_account_data`: the accepted overlay entry, then the transaction layer.
+    /// `merge_account_data`: the accepted overlay entry, then the transaction layer. Like the
+    /// fork's `journaled_state` in Foundry, [`Self::selected`] is recorded after the merge.
     fn select_fork(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, fork: usize) {
         if self.registry.active == fork {
             return;
@@ -301,19 +316,29 @@ impl Cheats {
             );
             evm.state_mut().merge_transaction_account_from(address, &outgoing);
         }
+        self.selected = SavedState::rest_of(evm.state_mut());
         let active = mem::replace(&mut self.registry.active, fork);
         self.registry.forks[active].saved = Some(SavedState::save(outgoing));
     }
 
-    /// Restores every fork from the snapshot, persistent accounts included, as Foundry's
-    /// `revert_state` does.
+    /// Restores the fork the snapshot was taken on, persistent accounts included, and leaves
+    /// the other forks alone, as Foundry's `revert_state` does.
+    ///
+    /// If another fork is active, it keeps its accepted overlay and gets back the transaction
+    /// layer it was selected with, as Foundry keeps that fork's database and `journaled_state`.
+    /// Only its writes since it was selected are dropped.
     fn revert_to(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, id: usize) {
-        let snapshot = self.registry.snapshots[id].clone();
-        for (fork, saved) in self.registry.forks.iter_mut().zip(snapshot.saved) {
-            fork.saved = saved;
+        let RegistrySnapshot { active, active_state, selected } =
+            self.registry.snapshots[id].clone();
+        let restored = active_state.into_state(self.registry.backing(active));
+        let mut left = mem::replace(evm.state_mut(), restored);
+        let left_selected = mem::replace(&mut self.selected, selected);
+        let left_fork = mem::replace(&mut self.registry.active, active);
+        if left_fork != active {
+            let cache = mem::take(&mut left.overlay_db_mut().cache);
+            self.registry.forks[left_fork].saved = Some(SavedState { cache, rest: left_selected });
+            self.registry.forks[active].saved = None;
         }
-        self.registry.active = snapshot.active;
-        *evm.state_mut() = snapshot.active_state.into_state(self.registry.backing(snapshot.active));
     }
 
     /// Runs a nested transaction over the moved overlay and publishes it mid-transaction.
@@ -457,11 +482,16 @@ impl Executor {
         self.set_code(TEST, script_code(script));
         let active = self.registry.active;
         let mut evm = new_evm(EmptyDB::default());
-        *evm.state_mut() = self.active.take().unwrap().load(self.registry.backing(active));
+        let state = self.active.take().unwrap();
+        // The previous call accepted or dropped the active fork's transaction layer, so the call
+        // start counts as its selection.
+        let selected = state.rest.clone();
+        *evm.state_mut() = state.load(self.registry.backing(active));
         evm.set_inspector(Cheats {
             registry: mem::take(&mut self.registry),
             speculative: mode == Mode::Discard,
             start_fork: active,
+            selected,
             captured: None,
             capture_start_overlay: self.capture_start_overlay,
             captured_start_cache: None,
@@ -737,6 +767,77 @@ fn snapshot_restore_reverts_persistent_accounts() {
     executor.registry.persistent.insert(COUNTER);
     executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
     assert_eq!(counter(&executor, 0), 10);
+}
+
+/// Like Foundry's, a snapshot restore replaces only the fork the snapshot was taken on. Other
+/// forks keep their committed and pending writes.
+#[test]
+fn snapshot_restore_leaves_other_forks() {
+    let new = || Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
+    let counters = |executor: &Executor| (counter(executor, 0), counter(executor, 1));
+
+    // B's write was committed while B was active, and B is still active at the restore.
+    let mut executor = new();
+    executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
+    executor.run(&[INC, select(1), INC], Mode::Commit);
+    executor.run(&[(CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    assert_eq!(executor.registry.active, 0);
+    assert_eq!(counters(&executor), (10, 21));
+
+    // B's write was committed while B was inactive.
+    let mut executor = new();
+    executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
+    executor.run(&[INC, select(1), INC, select(0)], Mode::Commit);
+    executor.run(&[(CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    assert_eq!(counters(&executor), (10, 21));
+
+    // B's write is still pending in its saved state when A's snapshot is restored.
+    let mut executor = new();
+    let script: &[(Address, &[u8])] =
+        &[(CHEATS, &[SNAPSHOT]), INC, select(1), INC, select(0), (CHEATS, &[REVERT_TO, 0])];
+    executor.run(script, Mode::Commit);
+    assert_eq!(counters(&executor), (10, 21));
+}
+
+/// A restore that leaves the active fork drops only what the fork wrote since it was selected, as
+/// Foundry keeps that fork's database and the `journaled_state` it was selected with.
+#[test]
+fn snapshot_restore_drops_writes_since_left_fork_was_selected() {
+    let new = || Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
+
+    // B was selected in this transaction.
+    let mut executor = new();
+    executor.run(&[(CHEATS, &[SNAPSHOT]), select(1), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    assert_eq!(executor.registry.active, 0);
+    assert_eq!(counter(&executor, 1), 20);
+
+    // B was selected in an earlier call.
+    let mut executor = new();
+    executor.run(&[(CHEATS, &[SNAPSHOT]), select(1)], Mode::Commit);
+    executor.run(&[INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    assert_eq!(counter(&executor, 1), 20);
+
+    // B's write from an earlier selection stays pending; only the one since it was reselected is
+    // dropped.
+    let mut executor = new();
+    let script: &[(Address, &[u8])] = &[
+        (CHEATS, &[SNAPSHOT]),
+        select(1),
+        INC,
+        select(0),
+        select(1),
+        INC,
+        (CHEATS, &[REVERT_TO, 0]),
+    ];
+    executor.run(script, Mode::Commit);
+    assert_eq!(counter(&executor, 1), 21);
+
+    // `vm.transact` writes B's overlay, as Foundry writes the fork's database, so it stays.
+    let mut executor = new();
+    let script: &[(Address, &[u8])] =
+        &[(CHEATS, &[SNAPSHOT]), select(1), (CHEATS, &[TRANSACT, 0]), (CHEATS, &[REVERT_TO, 0])];
+    executor.run(script, Mode::Commit);
+    assert_eq!(counter(&executor, 1), 21);
 }
 
 #[test]
