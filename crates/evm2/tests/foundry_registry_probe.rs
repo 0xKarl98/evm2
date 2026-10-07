@@ -66,6 +66,8 @@ const TRANSACT: u8 = 4;
 /// Writes `COUNTER` slot 0 = 100 like `loadAllocs` and `cloneAccount`: through the transaction
 /// layer, as master writes them to the journal.
 const STATE_WRITE: u8 = 5;
+/// `makePersistent(arg)`, where `arg` is the address's last byte. Changes only the registry.
+const MAKE_PERSISTENT: u8 = 6;
 
 /// Read-only backing database standing in for `SharedBackend`: shared by clones, `Send + Sync`,
 /// and never written by commits.
@@ -204,7 +206,8 @@ struct RegistrySnapshot {
 struct Registry {
     forks: Vec<ForkEntry>,
     active: usize,
-    snapshots: Vec<RegistrySnapshot>,
+    /// Shared by copies of the registry, so a copy doesn't copy the snapshots' states.
+    snapshots: Vec<Arc<RegistrySnapshot>>,
     persistent: AddressSet,
 }
 
@@ -230,8 +233,9 @@ struct Cheats {
     /// started. Foundry stores this with the fork as its `journaled_state`. A snapshot restore
     /// that leaves the fork puts it back, so only the fork's writes since are dropped.
     selected: StateSnapshot,
-    /// Registry captured before the first mutation of a speculative call.
-    captured: Option<Registry>,
+    /// The registry as it was before the first registry mutation of a speculative call. The live
+    /// registry is copied from it on write.
+    captured: Option<Arc<Registry>>,
     /// Whether to also capture the start fork's accepted overlay. The issue only names the
     /// registry and saved forks; without this, overlay writes and snapshot restores of the start
     /// fork survive the discard.
@@ -371,7 +375,7 @@ impl Cheats {
                     active_state,
                     selected: self.selected.clone(),
                 };
-                self.registry_mut().snapshots.push(snapshot);
+                self.registry_mut().snapshots.push(Arc::new(snapshot));
                 Some(Bytes::new())
             }
             REVERT_TO => {
@@ -400,31 +404,31 @@ impl Cheats {
                 evm.state_mut().storage_slot(&COUNTER, Word::ZERO).ok()?.set(Word::from(100));
                 Some(Bytes::new())
             }
+            MAKE_PERSISTENT => {
+                self.registry_mut().persistent.insert(Address::with_last_byte(input[1]));
+                Some(Bytes::new())
+            }
             _ => None,
         }
     }
 
-    /// Lazily captures what a speculative call must restore, or copies the accepted overlay that
-    /// an [`Executor::call`] shares.
+    /// Copies the accepted overlay that an [`Executor::call`] shares, or captures the start
+    /// fork's overlay that a speculative call must restore.
     ///
-    /// Every mutation calls this first. The first mutation always happens while the start fork is
-    /// still active.
+    /// Every operation that saves, replaces, or writes fork state calls this first, so the first
+    /// call always happens while the start fork is still active. Operations that change only the
+    /// registry don't call it; [`Self::registry_mut`] copies the registry alone.
     fn capture(&mut self, evm: &mut Evm<'_, BaseEvmTypes>) {
         if let Some(accepted) = self.shared_overlay.take() {
-            // Like `CowBackend::backend_mut`, but the overlay must be copied before any mutation,
-            // not just one of the registry: a snapshot or a saved fork keeps only the overlay
-            // cache and reloads it over the backing database, which would skip the shared overlay.
+            // A snapshot or a saved fork keeps only the overlay cache and reloads it over the
+            // backing database, which would skip the shared overlay.
             let backing = self.registry.backing(self.registry.active);
             let overlay = evm.overlay_db_mut();
             let reads = mem::replace(&mut overlay.cache, Cache::clone(&accepted));
             overlay.cache.merge(reads);
             overlay.db = Box::new(backing);
         }
-        if !self.speculative || self.captured.is_some() {
-            return;
-        }
-        self.captured = Some(Registry::clone(&self.registry));
-        if self.capture_start_overlay {
+        if self.speculative && self.capture_start_overlay && self.captured_start_cache.is_none() {
             self.captured_start_cache = Some(evm.overlay_db().cache.clone());
         }
     }
@@ -466,7 +470,7 @@ impl Cheats {
     /// Only its writes since it was selected are dropped.
     fn revert_to(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, id: usize) {
         let RegistrySnapshot { active, active_state, selected } =
-            self.registry.snapshots[id].clone();
+            RegistrySnapshot::clone(&self.registry.snapshots[id]);
         if active != self.registry.active {
             self.record_root_start(active);
         }
@@ -627,10 +631,12 @@ impl Cheats {
         }
     }
 
-    /// The registry, copied first if an [`Executor::call`] shares it. [`Self::capture`] must have
-    /// copied the shared overlay already.
+    /// The registry, copied on write like `CowBackend::backend_mut`: if an [`Executor::call`]
+    /// shares it, or if a speculative call keeps it as captured. Snapshots stay shared.
     fn registry_mut(&mut self) -> &mut Registry {
-        assert!(self.shared_overlay.is_none(), "registry mutated before capture");
+        if self.speculative && self.captured.is_none() {
+            self.captured = Some(Arc::clone(&self.registry));
+        }
         Arc::make_mut(&mut self.registry)
     }
 }
@@ -838,8 +844,9 @@ impl Executor {
         let Cheats { mut registry, start_fork, captured, captured_start_cache, .. } = cheats;
         self.parent_overlay_moved.extend(cheats.parent_overlay_moved);
         self.child_gas.extend(cheats.child_gas);
-        if let Some(captured) = captured {
-            // Speculative call that mutated the registry: restore it and recover the start fork.
+        if captured.is_some() || captured_start_cache.is_some() {
+            // Speculative call that mutated the registry or fork state: restore them and recover
+            // the start fork.
             let mut start = if registry.active == start_fork {
                 state
             } else {
@@ -854,7 +861,7 @@ impl Executor {
                 start.overlay_db_mut().cache = cache;
             }
             self.active = Some(SavedState::save(start));
-            self.registry = Arc::new(captured);
+            self.registry = captured.unwrap_or(registry);
             return;
         }
         if mode == Mode::Commit {
@@ -1079,6 +1086,8 @@ fn nonce(executor: &Executor) -> u64 {
 }
 
 const INC: (Address, &[u8]) = (COUNTER, &[]);
+
+const PERSIST_COUNTER: (Address, &[u8]) = (CHEATS, &[MAKE_PERSISTENT, COUNTER.0.0[19]]);
 
 const fn select(fork: u8) -> (Address, &'static [u8]) {
     match fork {
@@ -1321,6 +1330,10 @@ fn speculative_call_without_start_overlay_capture_leaks() {
     executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
     executor.run(&[INC], Mode::Commit);
     executor.run(&[(CHEATS, &[TRANSACT, 0]), (CHEATS, &[REVERT_TO, 0])], Mode::Discard);
+    assert_eq!(counter(&executor, 0), 11);
+
+    // An overlay write alone, with no registry mutation, is restored too.
+    executor.run(&[(CHEATS, &[TRANSACT, 0])], Mode::Discard);
     assert_eq!(counter(&executor, 0), 11);
 }
 
@@ -1616,6 +1629,7 @@ fn staged_write_mid_transaction() {
 #[ignore = "measurement"]
 fn measure_per_call_evm_construction_and_cache_move() {
     const ITERS: u32 = 20_000;
+    const SNAPSHOTS: usize = 10;
 
     fn time(iters: u32, mut f: impl FnMut()) -> Duration {
         let start = Instant::now();
@@ -1671,9 +1685,33 @@ fn measure_per_call_evm_construction_and_cache_move() {
         });
         let loaded = saved.take().unwrap().load(backing.clone());
         let cloned = time(ITERS.min(200), || drop(black_box(loaded.snapshot())));
+        // A registry with an inactive fork and snapshots of this size.
+        let registry = Registry {
+            forks: vec![ForkEntry {
+                backing: backing.clone(),
+                saved: Some(SavedState::save(loaded.clone())),
+            }],
+            snapshots: (0..SNAPSHOTS)
+                .map(|_| {
+                    Arc::new(RegistrySnapshot {
+                        active: 0,
+                        active_state: loaded.snapshot(),
+                        selected: SavedState::default().rest,
+                    })
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let registry_cloned = time(ITERS, || drop(black_box(Registry::clone(&registry))));
+        let snapshots_cloned = time(ITERS.min(20), || {
+            let snapshots =
+                registry.snapshots.iter().map(|snapshot| RegistrySnapshot::clone(snapshot));
+            drop(black_box(snapshots.collect::<Vec<_>>()))
+        });
         println!(
             "cache of {accounts} accounts + slots: Evm::new + move in/out {moved:?}; \
-             with a counter tx {call:?}; StateSnapshot clone {cloned:?}"
+             with a counter tx {call:?}; StateSnapshot clone {cloned:?}; Registry clone with \
+             {SNAPSHOTS} snapshots {registry_cloned:?}, copying the snapshots {snapshots_cloned:?}"
         );
     }
 }
@@ -1820,4 +1858,58 @@ fn registry_and_saved_state_are_send() {
     assert_send_sync::<SavedState>();
     assert_send_sync::<Registry>();
     assert_send_sync::<Executor>();
+}
+
+/// Like `CowBackend`, a call copies only what it changes. A registry-only cheatcode such as
+/// `makePersistent` copies the registry, which shares the snapshots, and leaves the accepted
+/// overlay shared.
+#[test]
+fn speculative_call_copies_only_registry_for_registry_op() {
+    let script: &[(Address, &[u8])] = &[(HANDLER, &[]), INC];
+    for isolate in [false, true] {
+        let mut executor = executor_with(&[(HANDLER, script_code(&[PERSIST_COUNTER]))]);
+        executor.isolate = isolate;
+        executor.run(&[INC, (CHEATS, &[SNAPSHOT])], Mode::Commit);
+
+        executor.set_code(TEST, returning_script_code(script));
+        let (output, cheats) = executor.call();
+        assert_eq!(Word::from_be_slice(&output), Word::from(12), "isolate: {isolate}");
+        assert!(cheats.registry.persistent.contains(&COUNTER), "isolate: {isolate}");
+        assert!(cheats.shared_overlay.is_some(), "the overlay was copied, isolate: {isolate}");
+        assert!(
+            Arc::ptr_eq(&cheats.registry.snapshots[0], &executor.registry.snapshots[0]),
+            "the snapshot was copied, isolate: {isolate}"
+        );
+        drop(cheats);
+        assert!(!executor.registry.persistent.contains(&COUNTER), "isolate: {isolate}");
+        assert_eq!(counter(&executor, 0), 11, "isolate: {isolate}");
+    }
+}
+
+/// A fork switch after a registry-only cheatcode still copies the overlay before it saves the
+/// start fork, and the account made persistent follows the switch. Shared or owned, the
+/// speculative call leaves the registry and both forks as they were.
+#[test]
+fn speculative_call_after_registry_op_switches_forks() {
+    let script: &[(Address, &[u8])] = &[PERSIST_COUNTER, select(1), INC];
+    let mut executor = executor_with(&[]);
+    executor.run(&[INC], Mode::Commit);
+    let mut control = executor.clone();
+    control.run(script, Mode::Commit);
+    assert_eq!((counter(&control, 0), counter(&control, 1)), (11, 12));
+
+    executor.set_code(TEST, returning_script_code(script));
+    let (output, cheats) = executor.call();
+    assert_eq!(Word::from_be_slice(&output), Word::from(12));
+    assert!(cheats.shared_overlay.is_none());
+    drop(cheats);
+
+    let mut owned = executor.clone();
+    owned.run(&[PERSIST_COUNTER], Mode::Discard);
+    owned.run(script, Mode::Discard);
+    for executor in [&executor, &owned] {
+        assert!(!executor.registry.persistent.contains(&COUNTER));
+        assert_eq!(executor.registry.active, 0);
+        assert_eq!((counter(executor, 0), counter(executor, 1)), (11, 20));
+    }
 }
