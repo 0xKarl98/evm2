@@ -19,12 +19,17 @@ use evm2::{
     bytecode::Bytecode,
     env::BlockEnvExt,
     ethereum::{TxEnvelope, ethereum_tx_registry},
-    evm::{AccountInfo, Cache, DbResult, DynDatabase, EmptyDB, PendingState, State, StateSnapshot},
+    evm::{
+        AccountInfo, Cache, DbResult, DynDatabase, EmptyDB, PendingState, State, StateCheckpoint,
+        StateSnapshot,
+    },
     interpreter::{GasTracker, InstrStop, Interpreter, Message, MessageResult, Word, op},
 };
 use std::{
+    cell::RefCell,
     hint::black_box,
     mem,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,6 +48,10 @@ const COLD_COUNTER: Address = Address::with_last_byte(0xc1);
 const DEPLOYED: Address = Address::with_last_byte(0xd0);
 /// Stand-in for the cheatcode address.
 const CHEATS: Address = Address::with_last_byte(0xcc);
+/// Script contracts the test calls, so that with isolation their cheatcodes run inside a child.
+const HANDLER: Address = Address::with_last_byte(0x4a);
+const NESTED: Address = Address::with_last_byte(0x4b);
+const FAILING: Address = Address::with_last_byte(0x4c);
 
 /// `selectFork(arg)`.
 const SELECT_FORK: u8 = 1;
@@ -223,8 +232,50 @@ struct Cheats {
     captured_start_cache: Option<Cache>,
     /// Run depth-1 calls as isolated transactions.
     isolate: bool,
+    /// Set while the inspector runs in an isolated child, whose calls aren't isolated again.
+    in_child: bool,
+    /// Snapshot restores in the running child that are still in effect, like master's
+    /// `isolated_snapshot_restores`.
+    child_restores: Vec<ChildRestore>,
+    /// Calls running in the child, like master's `isolated_frame_checkpoints`.
+    child_calls: Vec<ChildCall>,
     /// Whether the parent's overlay was empty while the isolated child ran.
     parent_overlay_moved: Vec<bool>,
+}
+
+/// The placeholder left in the parent while the isolated child runs the inspector.
+impl Default for Cheats {
+    fn default() -> Self {
+        Self {
+            registry: Registry::default(),
+            speculative: false,
+            start_fork: 0,
+            selected: SavedState::default().rest,
+            captured: None,
+            capture_start_overlay: false,
+            captured_start_cache: None,
+            isolate: false,
+            in_child: false,
+            child_restores: Vec::new(),
+            child_calls: Vec::new(),
+            parent_overlay_moved: Vec::new(),
+        }
+    }
+}
+
+/// What a snapshot restore in an isolated child replaced.
+struct ChildRestore {
+    /// The fork active before the restore.
+    fork: usize,
+    state: StateSnapshot,
+    selected: StateSnapshot,
+}
+
+/// A call running in an isolated child.
+struct ChildCall {
+    checkpoint: StateCheckpoint,
+    /// Length of [`Cheats::child_restores`] when the call started.
+    restores: usize,
 }
 
 impl Inspector<BaseEvmTypes> for Cheats {
@@ -237,10 +288,25 @@ impl Inspector<BaseEvmTypes> for Cheats {
             let output = self.dispatch(interp.host(), &message.input);
             return Some(message_result(message, output.is_some(), output.unwrap_or_default()));
         }
-        if self.isolate && message.depth == 1 {
+        if self.isolate && !self.in_child && message.depth == 1 {
             return Some(self.isolated_call(interp.host(), message));
         }
+        if self.in_child {
+            let checkpoint = interp.host().state().checkpoint();
+            self.child_calls.push(ChildCall { checkpoint, restores: self.child_restores.len() });
+        }
         None
+    }
+
+    fn call_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+        message: &Message<BaseEvmTypes>,
+        result: &mut MessageResult<BaseEvmTypes>,
+    ) {
+        if self.in_child && message.destination != CHEATS {
+            self.finish_child_call(interp.host(), result.is_success());
+        }
     }
 }
 
@@ -264,6 +330,13 @@ impl Cheats {
             }
             REVERT_TO => {
                 self.capture(evm);
+                if self.in_child {
+                    self.child_restores.push(ChildRestore {
+                        fork: self.registry.active,
+                        state: evm.state().snapshot(),
+                        selected: self.selected.clone(),
+                    });
+                }
                 self.revert_to(evm, usize::from(input[1]));
                 Some(Bytes::new())
             }
@@ -353,11 +426,16 @@ impl Cheats {
         Some(output)
     }
 
+    /// Runs the call as a transaction in a child [`Evm`] that runs this inspector too, so
+    /// cheatcodes called inside the child are dispatched, then folds the child's state back in
+    /// like master's `transact_inner`.
     fn isolated_call(
         &mut self,
         evm: &mut Evm<'_, BaseEvmTypes>,
         message: &Message<BaseEvmTypes>,
     ) -> MessageResult<BaseEvmTypes> {
+        let source_fork = self.registry.active;
+        let cheats = Rc::new(RefCell::new(Self { in_child: true, ..mem::take(self) }));
         let mut moved = false;
         let result = run_child_with(evm, |parent, child| {
             moved = parent.overlay_db().cache.accounts.is_empty()
@@ -368,17 +446,74 @@ impl Cheats {
                 message.input.clone(),
                 message.gas_limit,
             );
+            child.set_inspector(ChildCheats(Rc::clone(&cheats)));
             child.transact(&tx).map(|executed| executed.detach())
         });
+        let cheats = Rc::into_inner(cheats).expect("the child is dropped").into_inner();
+        *self = Self { in_child: false, ..cheats };
+        let restored = !mem::take(&mut self.child_restores).is_empty();
+        self.child_calls.clear();
         self.parent_overlay_moved.push(moved);
         match result {
             Ok(out) => {
                 let success = out.result.status;
-                evm.state_mut().merge_isolated_state(out.pending_state);
+                if self.registry.active != source_fork || (success && restored) {
+                    // The child's state replaces the parent's after a fork switch, as in master.
+                    // After a snapshot restore it also drops what the child no longer has, like
+                    // master's `merge_child_state(.., true)`.
+                    evm.state_mut().set_pending_state(out.pending_state);
+                } else {
+                    evm.state_mut().merge_isolated_state(out.pending_state);
+                }
                 message_result(message, success, out.result.output)
             }
             Err(_) => message_result(message, false, Bytes::new()),
         }
+    }
+
+    /// Undoes the snapshot restores of a failed call in the child, like master's
+    /// `finish_isolated_snapshot_frame`, so they don't escape the call.
+    ///
+    /// evm2 already rolled the call back, but on the restored journal, which the call's checkpoint
+    /// doesn't index. Put back the state from before the call's first restore and roll that back.
+    /// Like fork selections, restores that end on another fork are not undone.
+    fn finish_child_call(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, success: bool) {
+        let call = self.child_calls.pop().expect("the call started in the child");
+        if success || self.child_restores.len() == call.restores {
+            return;
+        }
+        let ChildRestore { fork, state, selected } =
+            self.child_restores.drain(call.restores..).next().unwrap();
+        if fork != self.registry.active {
+            return;
+        }
+        let mut state = state.into_state(self.registry.backing(fork));
+        state.rollback(call.checkpoint, evm.version().features);
+        *evm.state_mut() = state;
+        self.selected = selected;
+    }
+}
+
+/// Runs the parent's [`Cheats`] in an isolated child. [`Evm::clear_inspector_as`] needs a
+/// `'static` [`Evm`], so the parent takes the inspector back through the shared cell.
+struct ChildCheats(Rc<RefCell<Cheats>>);
+
+impl Inspector<BaseEvmTypes> for ChildCheats {
+    fn call(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+        message: &mut Message<BaseEvmTypes>,
+    ) -> Option<MessageResult<BaseEvmTypes>> {
+        self.0.borrow_mut().call(interp, message)
+    }
+
+    fn call_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
+        message: &Message<BaseEvmTypes>,
+        result: &mut MessageResult<BaseEvmTypes>,
+    ) {
+        self.0.borrow_mut().call_end(interp, message, result);
     }
 }
 
@@ -492,11 +627,9 @@ impl Executor {
             speculative: mode == Mode::Discard,
             start_fork: active,
             selected,
-            captured: None,
             capture_start_overlay: self.capture_start_overlay,
-            captured_start_cache: None,
             isolate: self.isolate,
-            parent_overlay_moved: Vec::new(),
+            ..Default::default()
         });
         let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
         let result = match mode {
@@ -627,6 +760,15 @@ fn counter_code() -> Bytecode {
 
 /// Code that performs `calls` in order and ignores their results.
 fn script_code(calls: &[(Address, &[u8])]) -> Bytecode {
+    script_code_ending(calls, &[op::STOP])
+}
+
+/// Like [`script_code`], then reverts.
+fn reverting_script_code(calls: &[(Address, &[u8])]) -> Bytecode {
+    script_code_ending(calls, &[op::PUSH0, op::PUSH0, op::REVERT])
+}
+
+fn script_code_ending(calls: &[(Address, &[u8])], end: &[u8]) -> Bytecode {
     let mut code = Vec::new();
     for (to, data) in calls {
         let mut word = [0; 32];
@@ -640,8 +782,18 @@ fn script_code(calls: &[(Address, &[u8])]) -> Bytecode {
         code.extend_from_slice(to.as_slice());
         code.extend([op::GAS, op::CALL, op::POP]);
     }
-    code.push(op::STOP);
+    code.extend_from_slice(end);
     Bytecode::new_legacy(code.into())
+}
+
+/// An executor over two forks, with counters at 10 and 20, and `contracts` on the first.
+fn executor_with(contracts: &[(Address, Bytecode)]) -> Executor {
+    let mut executor =
+        Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
+    for (address, code) in contracts {
+        executor.set_code(*address, code.clone());
+    }
+    executor
 }
 
 fn counter(executor: &Executor, fork: usize) -> u64 {
@@ -909,28 +1061,112 @@ fn isolated_child_shares_overlay_by_move() {
     assert_eq!(backing.reads(), reads, "children read the moved overlay, not the backing");
 }
 
-/// Gap: evm2 has no `remove_absent`. After a snapshot restore inside an isolated child, the
-/// parent must drop state the child no longer has, as master's `merge_child_state(.., true)` does.
+/// Cheatcodes that a contract calls inside an isolated child reach the inspector. A fork the child
+/// selects stays selected in the parent, which adopts the child's state.
 #[test]
-fn isolated_child_snapshot_restore_needs_remove_absent() {
-    let backing = BackingDb::with_counter(10);
-    let mut parent = State::new(backing.clone());
-    // The parent transaction wrote the counter after the snapshot that the child restores.
-    let mut written = PendingState::default();
-    written.insert_storage(COUNTER, Word::ZERO, Word::from(10), Word::from(11));
-    parent.set_pending_state(written);
-    // The restored child state predates the write, so it no longer has the slot.
-    let restored = PendingState::default();
+fn isolated_child_dispatches_cheatcodes() {
+    for isolate in [false, true] {
+        let mut executor =
+            executor_with(&[(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT]), select(1), INC]))]);
+        executor.isolate = isolate;
 
-    let mut merged = parent.clone_with(backing);
-    merged.merge_isolated_state(restored.clone());
-    assert_eq!(merged.get_storage(&COUNTER, &Word::ZERO), Some(Word::from(11)), "write survives");
+        executor.run(&[(HANDLER, &[]), INC], Mode::Commit);
+        assert_eq!(executor.registry.snapshots.len(), 1, "isolate: {isolate}");
+        assert_eq!(executor.registry.active, 1, "isolate: {isolate}");
+        assert_eq!((counter(&executor, 0), counter(&executor, 1)), (10, 22), "isolate: {isolate}");
+    }
+}
 
-    // `set_pending_state` drops it, but it also replaces the parent's originals and warmth with
-    // the child's, which master keeps for the entries both sides still have.
-    parent.set_pending_state(restored);
-    assert_eq!(parent.get_storage(&COUNTER, &Word::ZERO), None);
-    assert_eq!(parent.storage_slot_untracked(&COUNTER, &Word::ZERO).unwrap(), Word::from(10));
+/// After a snapshot restore inside an isolated child, the parent drops its writes since the
+/// snapshot, as master's `merge_child_state(.., remove_absent = true)` does. evm2's
+/// `merge_isolated_state` has no such mode, but `set_pending_state` gives the same result: the
+/// restored state's originals are the parent's own, from when it took the snapshot.
+#[test]
+fn isolated_child_restore_drops_parent_writes_since_snapshot() {
+    for isolate in [false, true] {
+        let mut executor = executor_with(&[(
+            HANDLER,
+            script_code(&[(CHEATS, &[REVERT_TO, 0]), (COLD_COUNTER, &[])]),
+        )]);
+        executor.isolate = isolate;
+
+        executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[])], Mode::Commit);
+        assert_eq!(counter(&executor, 0), 10, "isolate: {isolate}");
+        assert_eq!(
+            executor.storage(0, COLD_COUNTER, Word::ZERO),
+            Word::from(11),
+            "isolate: {isolate}"
+        );
+    }
+}
+
+/// A restore inside an isolated child that then reverts doesn't escape it, as in master's
+/// `test_reverted_isolated_restore_does_not_escape`.
+#[test]
+fn reverted_restore_in_isolated_child_does_not_escape() {
+    let mut executor =
+        executor_with(&[(FAILING, reverting_script_code(&[INC, (CHEATS, &[REVERT_TO, 0])]))]);
+    executor.isolate = true;
+
+    executor.run(&[INC, (CHEATS, &[SNAPSHOT]), INC, (FAILING, &[])], Mode::Commit);
+    assert_eq!(counter(&executor, 0), 12);
+}
+
+/// A reverted call inside an isolated child takes its restore with it, and the child goes on from
+/// the state before the call, as in master's `test_caught_nested_restore_revert_does_not_escape`.
+#[test]
+fn caught_reverted_restore_in_isolated_child_is_undone() {
+    let mut executor = executor_with(&[
+        (HANDLER, script_code(&[(FAILING, &[]), INC])),
+        (FAILING, reverting_script_code(&[INC, (CHEATS, &[REVERT_TO, 0])])),
+    ]);
+    executor.isolate = true;
+
+    executor.run(&[INC, (CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[])], Mode::Commit);
+    assert_eq!(counter(&executor, 0), 13);
+}
+
+/// A reverted call doesn't undo a restore made before it in the same isolated child, as in master's
+/// `test_successful_restore_survives_reverted_sibling`.
+#[test]
+fn isolated_child_restore_survives_reverted_sibling() {
+    let mut executor = executor_with(&[
+        (HANDLER, script_code(&[(NESTED, &[]), INC, (FAILING, &[])])),
+        (NESTED, script_code(&[INC, (CHEATS, &[SNAPSHOT]), INC, INC, (CHEATS, &[REVERT_TO, 0])])),
+        (FAILING, reverting_script_code(&[])),
+    ]);
+    executor.isolate = true;
+
+    // 11 after the restore, which undid 13.
+    executor.run(&[(HANDLER, &[])], Mode::Commit);
+    assert_eq!(counter(&executor, 0), 12);
+}
+
+/// Gap: state captured inside an isolated child loses the parent's earlier writes in the
+/// transaction once it replaces the parent's state. `prepare_isolated_state` makes the child's
+/// originals the parent's current values, as the child's gas accounting needs, and `Cache::commit`
+/// only accepts entries that differ from their original. Master keeps the writes because its commit
+/// takes the present value of every slot of a touched account. With the public API, a test can't
+/// rebase such state onto the parent's originals, so evm2 needs one.
+#[test]
+fn state_captured_in_isolated_child_loses_parent_writes() {
+    // The parent restores a snapshot taken inside a child.
+    let restored = [false, true].map(|isolate| {
+        let mut executor = executor_with(&[(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))]);
+        executor.isolate = isolate;
+        executor.run(&[INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+        counter(&executor, 0)
+    });
+    assert_eq!(restored, [11, 10], "plain, isolated");
+
+    // A child leaves the fork, which saves the child's state for it.
+    let left = [false, true].map(|isolate| {
+        let mut executor = executor_with(&[(HANDLER, script_code(&[select(1)]))]);
+        executor.isolate = isolate;
+        executor.run(&[INC, (HANDLER, &[])], Mode::Commit);
+        counter(&executor, 0)
+    });
+    assert_eq!(left, [11, 10], "plain, isolated");
 }
 
 #[test]
