@@ -1076,31 +1076,6 @@ impl<'a> State<'a> {
         }
     }
 
-    /// Restores the originals that [`Self::prepare_isolated_state`] reset, for state captured
-    /// inside an isolated transaction that outlives it.
-    ///
-    /// Every account and slot loaded in both this state and `base`, the state the isolated
-    /// transaction was prepared from, takes its original from `base`. Current values, metadata,
-    /// and entries `base` did not load are unchanged. Without this, committing the captured state
-    /// as part of the enclosing transaction drops writes made before the isolated transaction,
-    /// since a commit only accepts entries that differ from their original.
-    pub fn rebase_isolated_originals(&mut self, base: &State<'_>) {
-        for (address, account) in &mut self.accounts {
-            if let Some(base) = base.accounts.get(address) {
-                account.original = base.original.clone();
-            }
-        }
-        for (address, storage) in &mut self.storage {
-            if let Some(base) = base.storage.get(address) {
-                for (key, slot) in &mut storage.slots {
-                    if let Some(base) = base.slots.get(key) {
-                        slot.value.original = base.value.original;
-                    }
-                }
-            }
-        }
-    }
-
     /// Reattaches a detached [`PendingState`] as the current transaction overlay, replacing it.
     ///
     /// This is the inverse of the detach performed by
@@ -1381,53 +1356,6 @@ mod tests {
 
         assert_eq!(parent.account(&address).unwrap().nonce(), 1);
         assert_eq!(parent.storage_slot_untracked(&address, &key).unwrap(), Word::from(9));
-    }
-
-    #[test]
-    fn isolated_state_rebases_captured_originals() {
-        let address = Address::with_last_byte(42);
-        let child_only = Address::with_last_byte(43);
-        let mut db = CacheDB::default();
-        for (address, value) in [(address, 5), (child_only, 6)] {
-            db.insert_account_info(&address, AccountInfo::default().with_balance(Word::from(2)));
-            db.insert_account_storage(&address, &Word::ZERO, &Word::from(value));
-        }
-        let mut parent = State::new(db.clone());
-        parent.account(&address).unwrap().set_balance(Word::ONE);
-        parent.storage_slot(&address, Word::ZERO).unwrap().set(Word::from(7));
-        parent.storage_slot(&address, Word::ONE).unwrap().set(Word::from(8));
-
-        let mut child = State::new(db.clone());
-        child.set_pending_state(parent.prepare_isolated_state());
-        child.storage_slot(&address, Word::ONE).unwrap().set(Word::from(9));
-        child.storage_slot(&child_only, Word::ZERO).unwrap().set(Word::from(10));
-        let mut rebased = child.clone_with(db);
-        rebased.rebase_isolated_originals(&parent);
-
-        let original = rebased.accounts[&address].original.as_ref().map(|info| info.balance);
-        assert_eq!(original, Some(Word::from(2)));
-        for (address, key, original, current) in [
-            (address, Word::ZERO, 5, 7),
-            (address, Word::ONE, 0, 9),
-            (child_only, Word::ZERO, 6, 10),
-        ] {
-            let slot = rebased.storage_slot(&address, key).unwrap();
-            assert_eq!(
-                (slot.original(), slot.current()),
-                (Word::from(original), Word::from(current))
-            );
-        }
-
-        // Without the rebase, a commit loses the parent's writes that the child didn't change.
-        let accepted = [rebased, child].map(|mut state| {
-            state.commit_transaction();
-            let balance = state.account_info_untracked(&address).unwrap().unwrap().balance;
-            let slots = [(address, Word::ZERO), (address, Word::ONE), (child_only, Word::ZERO)]
-                .map(|(address, key)| state.storage_slot_untracked(&address, &key).unwrap());
-            (balance, slots)
-        });
-        assert_eq!(accepted[0], (Word::ONE, [7, 9, 10].map(Word::from)));
-        assert_eq!(accepted[1], (Word::from(2), [5, 9, 10].map(Word::from)));
     }
 
     #[test]
