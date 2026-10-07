@@ -5,7 +5,8 @@
 //! state between calls, builds an [`Evm`] per call, and moves the state in and out. Cheatcodes are
 //! dispatched from an [`Inspector::call`] hook, which reaches the running [`Evm`] mid-transaction.
 //!
-//! Only public evm2 API is used. Run the measurement with
+//! Only public evm2 API is used, including [`State::rebase_isolated_originals`], which was added
+//! for the probe's isolated children. Run the measurement with
 //! `cargo test --release -p evm2 --test foundry_registry_probe -- --ignored --nocapture`.
 
 use alloy_consensus::{TxLegacy, transaction::Recovered};
@@ -234,6 +235,14 @@ struct Cheats {
     isolate: bool,
     /// Set while the inspector runs in an isolated child, whose calls aren't isolated again.
     in_child: bool,
+    /// While an isolated child runs: the fork it started on, and the parent's state there without
+    /// the moved overlay.
+    ///
+    /// `prepare_isolated_state` reset the child's originals to its start values. A commit only
+    /// accepts entries that differ from their original, so state the child captures on that fork
+    /// gets the parent's originals back. Otherwise the parent's writes before the child would be
+    /// lost once a snapshot taken in the child is restored or the fork the child left is accepted.
+    child_base: Option<(usize, State<'static>)>,
     /// Snapshot restores in the running child that are still in effect, like master's
     /// `isolated_snapshot_restores`.
     child_restores: Vec<ChildRestore>,
@@ -256,6 +265,7 @@ impl Default for Cheats {
             captured_start_cache: None,
             isolate: false,
             in_child: false,
+            child_base: None,
             child_restores: Vec::new(),
             child_calls: Vec::new(),
             parent_overlay_moved: Vec::new(),
@@ -320,9 +330,17 @@ impl Cheats {
             }
             SNAPSHOT => {
                 self.capture(evm);
+                let active_state = match self.child_base(self.registry.active) {
+                    Some(base) => {
+                        let mut state = evm.state().clone_with(EmptyDB::default());
+                        state.rebase_isolated_originals(base);
+                        state.snapshot()
+                    }
+                    None => evm.state().snapshot(),
+                };
                 let snapshot = RegistrySnapshot {
                     active: self.registry.active,
-                    active_state: evm.state().snapshot(),
+                    active_state,
                     selected: self.selected.clone(),
                 };
                 self.registry.snapshots.push(snapshot);
@@ -380,7 +398,11 @@ impl Cheats {
             return;
         }
         let incoming = self.registry.forks[fork].saved.take().expect("inactive fork is saved");
-        let outgoing = mem::replace(evm.state_mut(), incoming.load(self.registry.backing(fork)));
+        let mut outgoing =
+            mem::replace(evm.state_mut(), incoming.load(self.registry.backing(fork)));
+        if let Some(base) = self.child_base(self.registry.active) {
+            outgoing.rebase_isolated_originals(base);
+        }
         for address in &self.registry.persistent {
             merge_accepted_account(
                 &mut evm.overlay_db_mut().cache,
@@ -446,11 +468,13 @@ impl Cheats {
                 message.input.clone(),
                 message.gas_limit,
             );
+            cheats.borrow_mut().child_base =
+                Some((source_fork, parent.state().clone_with(EmptyDB::default())));
             child.set_inspector(ChildCheats(Rc::clone(&cheats)));
             child.transact(&tx).map(|executed| executed.detach())
         });
         let cheats = Rc::into_inner(cheats).expect("the child is dropped").into_inner();
-        *self = Self { in_child: false, ..cheats };
+        *self = Self { in_child: false, child_base: None, ..cheats };
         let restored = !mem::take(&mut self.child_restores).is_empty();
         self.child_calls.clear();
         self.parent_overlay_moved.push(moved);
@@ -491,6 +515,11 @@ impl Cheats {
         state.rollback(call.checkpoint, evm.version().features);
         *evm.state_mut() = state;
         self.selected = selected;
+    }
+
+    /// The parent's state, while an isolated child that started on `fork` runs.
+    fn child_base(&self, fork: usize) -> Option<&State<'static>> {
+        self.child_base.as_ref().filter(|(base_fork, _)| *base_fork == fork).map(|(_, base)| base)
     }
 }
 
@@ -1142,14 +1171,15 @@ fn isolated_child_restore_survives_reverted_sibling() {
     assert_eq!(counter(&executor, 0), 12);
 }
 
-/// Gap: state captured inside an isolated child loses the parent's earlier writes in the
-/// transaction once it replaces the parent's state. `prepare_isolated_state` makes the child's
-/// originals the parent's current values, as the child's gas accounting needs, and `Cache::commit`
-/// only accepts entries that differ from their original. Master keeps the writes because its commit
-/// takes the present value of every slot of a touched account. With the public API, a test can't
-/// rebase such state onto the parent's originals, so evm2 needs one.
+/// State captured inside an isolated child keeps the parent's earlier writes in the transaction
+/// once it replaces the parent's state. `prepare_isolated_state` makes the child's originals the
+/// parent's current values, as the child's gas accounting needs, and `Cache::commit` only accepts
+/// entries that differ from their original. Master keeps the writes because its commit takes the
+/// present value of every slot of a touched account. Here [`Cheats::child_base`] rebases the
+/// captured state onto the parent's originals, which the public API couldn't do before
+/// [`State::rebase_isolated_originals`].
 #[test]
-fn state_captured_in_isolated_child_loses_parent_writes() {
+fn state_captured_in_isolated_child_keeps_parent_writes() {
     // The parent restores a snapshot taken inside a child.
     let restored = [false, true].map(|isolate| {
         let mut executor = executor_with(&[(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))]);
@@ -1157,7 +1187,7 @@ fn state_captured_in_isolated_child_loses_parent_writes() {
         executor.run(&[INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
         counter(&executor, 0)
     });
-    assert_eq!(restored, [11, 10], "plain, isolated");
+    assert_eq!(restored, [11, 11], "plain, isolated");
 
     // A child leaves the fork, which saves the child's state for it.
     let left = [false, true].map(|isolate| {
@@ -1166,7 +1196,7 @@ fn state_captured_in_isolated_child_loses_parent_writes() {
         executor.run(&[INC, (HANDLER, &[])], Mode::Commit);
         counter(&executor, 0)
     });
-    assert_eq!(left, [11, 10], "plain, isolated");
+    assert_eq!(left, [11, 11], "plain, isolated");
 }
 
 #[test]
