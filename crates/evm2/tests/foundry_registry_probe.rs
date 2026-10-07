@@ -369,15 +369,11 @@ impl Cheats {
             REVERT_TO => {
                 self.capture(evm);
                 if self.in_child {
-                    let base = match self.rebase {
-                        Rebase::Unguarded => None,
-                        _ => self.child_base.take(),
-                    };
                     self.child_restores.push(ChildRestore {
                         fork: self.registry.active,
                         state: evm.state().snapshot(),
                         selected: self.selected.clone(),
-                        base,
+                        base: self.child_base.take(),
                     });
                 }
                 self.revert_to(evm, usize::from(input[1]));
@@ -608,10 +604,7 @@ impl Cheats {
     fn rebase_captured(&self, fork: usize, state: &mut State<'_>) {
         let Some(base) = self.child_base(fork) else { return };
         match self.rebase {
-            Rebase::Adapter | Rebase::Unguarded => rebase_isolated_originals(state, base),
-            Rebase::StageParentWrites => {
-                state.overlay_db_mut().cache.merge(transaction_writes(base))
-            }
+            Rebase::Adapter => rebase_isolated_originals(state, base),
             Rebase::Off => {}
         }
     }
@@ -702,10 +695,6 @@ fn merge_accepted_account(target: &mut Cache, source: &Cache, address: &Address)
 enum Rebase {
     /// [`rebase_isolated_originals`], except while a snapshot restore in the child is in effect.
     Adapter,
-    /// [`rebase_isolated_originals`], also after a snapshot restore in the child.
-    Unguarded,
-    /// Stages the parent's writes in the captured overlay instead, as accepted state.
-    StageParentWrites,
     /// Keeps the child's originals and metadata, as master does.
     Off,
 }
@@ -1446,29 +1435,30 @@ fn isolated_child_restore_survives_reverted_sibling() {
 /// parent's current values, as the child's gas accounting needs, and `Cache::commit` only accepts
 /// entries that differ from their original. Master keeps the writes because its commit takes the
 /// present value of every slot of a touched account. Here [`Cheats::child_base`] rebases the
-/// captured state onto the parent's originals with [`rebase_isolated_originals`]. Staging the
-/// parent's writes in the captured overlay keeps them too; keeping the child's originals doesn't.
+/// captured state onto the parent's originals with [`rebase_isolated_originals`]. Keeping the
+/// child's originals, as [`Rebase::Off`] does, loses them.
 #[test]
 fn state_captured_in_isolated_child_keeps_parent_writes() {
-    let rebases = [None, Some(Rebase::Adapter), Some(Rebase::StageParentWrites), Some(Rebase::Off)];
+    let rebases = [None, Some(Rebase::Adapter), Some(Rebase::Off)];
 
     // The parent restores a snapshot taken inside a child.
     let contracts = [(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))];
     let script = [INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 0])];
     let restored = rebases.map(|rebase| counter_after(&contracts, &script, rebase));
-    assert_eq!(restored, [11, 11, 11, 10], "plain, adapter, staged, off");
+    assert_eq!(restored, [11, 11, 10], "plain, adapter, off");
 
     // A child leaves the fork, which saves the child's state for it.
     let contracts = [(HANDLER, script_code(&[select(1)]))];
     let left = rebases.map(|rebase| counter_after(&contracts, &[INC, (HANDLER, &[])], rebase));
-    assert_eq!(left, [11, 11, 11, 10], "plain, adapter, staged, off");
+    assert_eq!(left, [11, 11, 10], "plain, adapter, off");
 }
 
-/// Staging the parent's writes in the captured overlay breaks the invariant that the overlay holds
-/// only accepted state. A snapshot restore that leaves a fork keeps its overlay and drops its
-/// writes since it was selected, so the staged write outlives the restore.
+/// A snapshot restore that leaves a fork keeps its overlay and drops its writes since it was
+/// selected, also writes the parent made before a child captured the fork's state. The rebase only
+/// changes originals, so the overlay keeps holding accepted state alone. Staging the parent's
+/// writes in the captured overlay instead would keep them past the restore (11).
 #[test]
-fn staging_parent_writes_in_captured_overlay_outlives_restore() {
+fn restore_leaving_fork_drops_parent_writes_captured_in_isolated_child() {
     let contracts = [(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))];
     let script = [
         select(1),
@@ -1479,23 +1469,24 @@ fn staging_parent_writes_in_captured_overlay_outlives_restore() {
         (CHEATS, &[REVERT_TO, 1]),
         (CHEATS, &[REVERT_TO, 0]),
     ];
-    let results = [None, Some(Rebase::Adapter), Some(Rebase::StageParentWrites)]
-        .map(|rebase| counter_after(&contracts, &script, rebase));
-    assert_eq!(results, [10, 10, 11], "plain, adapter, staged");
+    let results =
+        [None, Some(Rebase::Adapter)].map(|rebase| counter_after(&contracts, &script, rebase));
+    assert_eq!(results, [10, 10], "plain, adapter");
 }
 
 /// [`rebase_isolated_originals`] re-adds the parent's entries that the captured state lacks. After
 /// a snapshot restore in the child, that brings back writes the restore dropped, so the adapter is
 /// skipped while such a restore is in effect: the state then comes from a snapshot whose originals
-/// are right already. A reverted call that undoes the restore turns it back on.
+/// are right already. Without that, the first script would end at 11. A reverted call that undoes
+/// the restore turns it back on.
 #[test]
 fn rebase_skipped_after_restore_in_isolated_child() {
     let contracts = [(HANDLER, script_code(&[(CHEATS, &[REVERT_TO, 0]), (CHEATS, &[SNAPSHOT])]))];
     let script: &[(Address, &[u8])] =
         &[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[]), (CHEATS, &[REVERT_TO, 1])];
-    let results = [None, Some(Rebase::Adapter), Some(Rebase::Unguarded)]
-        .map(|rebase| counter_after(&contracts, script, rebase));
-    assert_eq!(results, [10, 10, 11], "plain, adapter, unguarded");
+    let results =
+        [None, Some(Rebase::Adapter)].map(|rebase| counter_after(&contracts, script, rebase));
+    assert_eq!(results, [10, 10], "plain, adapter");
 
     let contracts = [
         (HANDLER, script_code(&[(FAILING, &[]), (CHEATS, &[SNAPSHOT])])),
