@@ -63,9 +63,9 @@ const REVERT_TO: u8 = 3;
 /// `vm.transact`-like nested transaction against `COUNTER` (arg 0) or `COLD_COUNTER` (arg 1),
 /// published to the accepted overlay mid-transaction.
 const TRANSACT: u8 = 4;
-/// Writes `COUNTER` slot 0 = 100 through `overlay_db_mut`, as the issue prescribes for
-/// `loadAllocs` and `cloneAccount`.
-const OVERLAY_WRITE: u8 = 5;
+/// Writes `COUNTER` slot 0 = 100 like `loadAllocs` and `cloneAccount`: through the transaction
+/// layer, as master writes them to the journal.
+const STATE_WRITE: u8 = 5;
 
 /// Read-only backing database standing in for `SharedBackend`: shared by clones, `Send + Sync`,
 /// and never written by commits.
@@ -396,13 +396,8 @@ impl Cheats {
                 let target = if input[1] == 0 { COUNTER } else { COLD_COUNTER };
                 self.transact(evm, target)
             }
-            OVERLAY_WRITE => {
-                self.capture(evm);
-                evm.overlay_db_mut().insert_account_storage(
-                    &COUNTER,
-                    &Word::ZERO,
-                    &Word::from(100),
-                );
+            STATE_WRITE => {
+                evm.state_mut().storage_slot(&COUNTER, Word::ZERO).ok()?.set(Word::from(100));
                 Some(Bytes::new())
             }
             _ => None,
@@ -1683,18 +1678,24 @@ fn measure_per_call_evm_construction_and_cache_move() {
     }
 }
 
-/// Gap: `loadAllocs` and `cloneAccount` are cheatcodes, so they run mid-transaction. A write
-/// through `overlay_db_mut` is then shadowed by the transaction layer and overwritten at commit.
+/// `loadAllocs` and `cloneAccount` are cheatcodes, so they run mid-transaction. Written through
+/// the transaction layer, as master writes the journal, they are seen by later calls whether the
+/// slot was loaded already or not, and accepted with the transaction. A write through
+/// `overlay_db_mut` would be shadowed by a loaded slot and overwritten at commit (12).
 #[test]
-fn overlay_write_mid_transaction_is_shadowed() {
-    let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.run(&[INC, (CHEATS, &[OVERLAY_WRITE]), INC], Mode::Commit);
-    assert_eq!(counter(&executor, 0), 12, "the cheatcode write was lost");
+fn state_write_mid_transaction_is_kept() {
+    let results = [&[INC, (CHEATS, &[STATE_WRITE]), INC][..], &[(CHEATS, &[STATE_WRITE]), INC]]
+        .map(|script| {
+            let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
+            executor.run(script, Mode::Commit);
+            counter(&executor, 0)
+        });
+    assert_eq!(results, [101, 101], "slot loaded before the write, not loaded");
 
-    // Control: the same write is visible when the slot was not loaded yet in this transaction.
+    // Like any write in the transaction, a discarded call drops it.
     let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.run(&[(CHEATS, &[OVERLAY_WRITE]), INC], Mode::Commit);
-    assert_eq!(counter(&executor, 0), 101);
+    executor.run(&[INC, (CHEATS, &[STATE_WRITE])], Mode::Discard);
+    assert_eq!(counter(&executor, 0), 10);
 }
 
 /// The active fork's accepted overlay, shared read-only with an [`Executor::call`].
