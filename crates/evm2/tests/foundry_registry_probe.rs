@@ -227,22 +227,12 @@ struct Cheats {
     /// The active fork's accepted overlay while an [`Executor::call`] shares it. The [`Evm`]
     /// reads it through [`AcceptedView`], so the live overlay cache holds only this call's reads.
     shared_overlay: Option<Arc<Cache>>,
-    /// Speculative calls capture the registry before its first mutation.
-    speculative: bool,
     /// The fork active when the call started.
     start_fork: usize,
     /// The active fork's transaction layer, journal, and logs as it was selected, or as the call
     /// started. Foundry stores this with the fork as its `journaled_state`. A snapshot restore
     /// that leaves the fork puts it back, so only the fork's writes since are dropped.
     selected: StateSnapshot,
-    /// The registry as it was before the first registry mutation of a speculative call. The live
-    /// registry is copied from it on write.
-    captured: Option<Arc<Registry>>,
-    /// Whether to also capture the start fork's accepted overlay. The issue only names the
-    /// registry and saved forks; without this, overlay writes and snapshot restores of the start
-    /// fork survive the discard.
-    capture_start_overlay: bool,
-    captured_start_cache: Option<Cache>,
     /// Run depth-1 calls as isolated transactions.
     isolate: bool,
     /// Set while the inspector runs in an isolated child, whose calls aren't isolated again.
@@ -279,12 +269,8 @@ impl Default for Cheats {
         Self {
             registry: Arc::default(),
             shared_overlay: None,
-            speculative: false,
             start_fork: 0,
             selected: SavedState::default().rest,
-            captured: None,
-            capture_start_overlay: false,
-            captured_start_cache: None,
             isolate: false,
             in_child: false,
             child_base: None,
@@ -414,8 +400,7 @@ impl Cheats {
         }
     }
 
-    /// Copies the accepted overlay that an [`Executor::call`] shares, or captures the start
-    /// fork's overlay that a speculative call must restore.
+    /// Copies the accepted overlay that an [`Executor::call`] shares.
     ///
     /// Every operation that saves, replaces, or writes fork state calls this first, so the first
     /// call always happens while the start fork is still active. Operations that change only the
@@ -429,9 +414,6 @@ impl Cheats {
             let reads = mem::replace(&mut overlay.cache, Cache::clone(&accepted));
             overlay.cache.merge(reads);
             overlay.db = Box::new(backing);
-        }
-        if self.speculative && self.capture_start_overlay && self.captured_start_cache.is_none() {
-            self.captured_start_cache = Some(evm.overlay_db().cache.clone());
         }
     }
 
@@ -634,12 +616,9 @@ impl Cheats {
         }
     }
 
-    /// The registry, copied on write like `CowBackend::backend_mut`: if an [`Executor::call`]
-    /// shares it, or if a speculative call keeps it as captured. Snapshots stay shared.
+    /// The registry, copied on write like `CowBackend::backend_mut` if an [`Executor::call`]
+    /// shares it. Snapshots stay shared.
     fn registry_mut(&mut self) -> &mut Registry {
-        if self.speculative && self.captured.is_none() {
-            self.captured = Some(Arc::clone(&self.registry));
-        }
         Arc::make_mut(&mut self.registry)
     }
 }
@@ -768,12 +747,6 @@ fn transaction_writes(state: &State<'_>) -> Cache {
     mem::take(&mut state.overlay_db_mut().cache)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    Commit,
-    Discard,
-}
-
 /// Foundry-style executor: owns the registry and the active fork's state between calls.
 #[derive(Clone)]
 struct Executor {
@@ -781,7 +754,6 @@ struct Executor {
     registry: Arc<Registry>,
     /// The active fork's state while no call runs.
     active: Option<SavedState>,
-    capture_start_overlay: bool,
     isolate: bool,
     rebase: Rebase,
     parent_overlay_moved: Vec<bool>,
@@ -800,7 +772,6 @@ impl Executor {
         Self {
             registry: Arc::new(registry),
             active,
-            capture_start_overlay: true,
             isolate: false,
             rebase: Rebase::Adapter,
             parent_overlay_moved: Vec::new(),
@@ -817,14 +788,14 @@ impl Executor {
         self.active = Some(SavedState::save(state));
     }
 
-    /// Calls the test contract running `script`.
-    fn run(&mut self, script: &[(Address, &[u8])], mode: Mode) {
-        let result = self.run_code(script_code(script), mode);
+    /// Calls the test contract running `script` and commits.
+    fn run(&mut self, script: &[(Address, &[u8])]) {
+        let result = self.run_code(script_code(script));
         assert!(result.status, "test call failed: {result:?}");
     }
 
-    /// Calls the test contract with `code`, which may fail.
-    fn run_code(&mut self, code: Bytecode, mode: Mode) -> TxResult<BaseEvmTypes> {
+    /// Calls the test contract with `code`, which may fail, and commits.
+    fn run_code(&mut self, code: Bytecode) -> TxResult<BaseEvmTypes> {
         self.set_code(TEST, code);
         let active = self.registry.active;
         let mut evm = new_evm(EmptyDB::default());
@@ -835,54 +806,27 @@ impl Executor {
         *evm.state_mut() = state.load(self.registry.backing(active));
         evm.set_inspector(Cheats {
             registry: mem::take(&mut self.registry),
-            speculative: mode == Mode::Discard,
             start_fork: active,
             selected,
-            capture_start_overlay: self.capture_start_overlay,
             isolate: self.isolate,
             rebase: self.rebase,
             ..Default::default()
         });
         let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
-        let result = match mode {
-            Mode::Commit => executed.commit(),
-            Mode::Discard => executed.discard(),
-        };
+        let result = executed.commit();
         let cheats = *evm.clear_inspector_as::<Cheats>().unwrap();
         let state = mem::replace(evm.state_mut(), State::new(EmptyDB::default()));
-        self.finish(cheats, state, mode);
+        self.finish(cheats, state);
         result
     }
 
-    fn finish(&mut self, cheats: Cheats, state: State<'_>, mode: Mode) {
-        let Cheats { mut registry, start_fork, captured, captured_start_cache, .. } = cheats;
+    fn finish(&mut self, cheats: Cheats, state: State<'_>) {
+        let mut registry = cheats.registry;
         self.parent_overlay_moved.extend(cheats.parent_overlay_moved);
         self.child_gas.extend(cheats.child_gas);
-        if captured.is_some() || captured_start_cache.is_some() {
-            // Speculative call that mutated the registry or fork state: restore them and recover
-            // the start fork.
-            let mut start = if registry.active == start_fork {
-                state
-            } else {
-                Arc::make_mut(&mut registry).forks[start_fork]
-                    .saved
-                    .take()
-                    .unwrap()
-                    .load(EmptyDB::default())
-            };
-            start.clear_transaction_state();
-            if let Some(cache) = captured_start_cache {
-                start.overlay_db_mut().cache = cache;
-            }
-            self.active = Some(SavedState::save(start));
-            self.registry = captured.unwrap_or(registry);
-            return;
-        }
-        if mode == Mode::Commit {
-            // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
-            for fork in &mut Arc::make_mut(&mut registry).forks {
-                fork.saved = fork.saved.take().map(SavedState::accept_transaction);
-            }
+        // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
+        for fork in &mut Arc::make_mut(&mut registry).forks {
+            fork.saved = fork.saved.take().map(SavedState::accept_transaction);
         }
         self.active = Some(SavedState::save(state));
         self.registry = registry;
@@ -1088,7 +1032,7 @@ fn counter_after(
         executor.isolate = true;
         executor.rebase = rebase;
     }
-    executor.run(script, Mode::Commit);
+    executor.run(script);
     counter(&executor, 0)
 }
 
@@ -1097,7 +1041,7 @@ fn run_isolated(handler: Bytecode, script: &[(Address, &[u8])], rebase: Rebase) 
     let mut executor = executor_with(&[(HANDLER, handler)]);
     executor.isolate = true;
     executor.rebase = rebase;
-    let result = executor.run_code(script_code(script), Mode::Commit);
+    let result = executor.run_code(script_code(script));
     assert!(result.status, "test call failed: {result:?}");
     (executor, result.total_gas_spent)
 }
@@ -1133,7 +1077,7 @@ fn emit(n: u8) -> (Address, &'static [u8]) {
 /// The data of the logs that a committed call of `code` returns, run plainly or isolated.
 fn logs_after(executor: &mut Executor, code: Bytecode, isolate: bool) -> Vec<u8> {
     executor.isolate = isolate;
-    let result = executor.run_code(code, Mode::Commit);
+    let result = executor.run_code(code);
     result.logs.iter().map(|log| log.data.data[0]).collect()
 }
 
@@ -1151,16 +1095,17 @@ fn commit_on_active_fork() {
     let backing = BackingDb::with_counter(10);
     let mut executor = Executor::new(vec![backing.clone()]);
 
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
     assert_eq!(executor.accepted(0, COUNTER, Word::ZERO), Some(Word::from(11)));
     let reads = backing.reads();
 
-    executor.run(&[INC, INC], Mode::Commit);
+    executor.run(&[INC, INC]);
     assert_eq!(counter(&executor, 0), 13);
     // The overlay serves the second transaction: the counter is not fetched again.
     assert_eq!(backing.reads(), reads);
 
-    executor.run(&[INC], Mode::Discard);
+    executor.set_code(TEST, script_code(&[INC]));
+    executor.call();
     assert_eq!(counter(&executor, 0), 13);
     // Commits never write the backing database.
     assert_eq!(backing.0.storage[&(COUNTER, Word::ZERO)], Word::from(10));
@@ -1172,7 +1117,7 @@ fn save_and_reload_fork_with_pending_writes_across_transactions() {
     let mut executor = Executor::new(vec![a.clone(), BackingDb::with_counter(20)]);
 
     // Write on A, switch to B mid-transaction, write on B, commit while B is active.
-    executor.run(&[INC, select(1), INC], Mode::Commit);
+    executor.run(&[INC, select(1), INC]);
     assert_eq!(executor.registry.active, 1);
     assert_eq!(executor.accepted(1, COUNTER, Word::ZERO), Some(Word::from(21)));
     // The commit also accepts A's write into A's own overlay, though A is inactive.
@@ -1184,12 +1129,12 @@ fn save_and_reload_fork_with_pending_writes_across_transactions() {
 
     // A later transaction reloads A with its accepted write and leaves it inactive again.
     let reads = a.reads();
-    executor.run(&[select(0), INC, select(1), INC], Mode::Commit);
+    executor.run(&[select(0), INC, select(1), INC]);
     assert_eq!((counter(&executor, 0), counter(&executor, 1)), (12, 22));
     assert_eq!(a.reads(), reads, "reloading A must reuse its moved cache");
 
     // Committing while A is active accepts its write as usual.
-    executor.run(&[select(0), INC], Mode::Commit);
+    executor.run(&[select(0), INC]);
     assert_eq!(executor.accepted(0, COUNTER, Word::ZERO), Some(Word::from(13)));
     assert_eq!((counter(&executor, 0), counter(&executor, 1)), (13, 22));
 }
@@ -1204,16 +1149,16 @@ fn reselected_fork_keeps_writes_it_does_not_repeat() {
     let mut executor =
         Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
     // Write two slots on A, then commit while B is active.
-    executor.run(&[INC, (COLD_COUNTER, &[]), select(1)], Mode::Commit);
+    executor.run(&[INC, (COLD_COUNTER, &[]), select(1)]);
 
     // Committing on A without writing keeps both.
     let mut reselected = executor.clone();
-    reselected.run(&[select(0)], Mode::Commit);
+    reselected.run(&[select(0)]);
     assert_eq!(reselected.registry.active, 0);
     assert_eq!(counters(&reselected), (11, 11));
 
     // Rewriting one keeps the other.
-    executor.run(&[select(0), INC], Mode::Commit);
+    executor.run(&[select(0), INC]);
     assert_eq!(counters(&executor), (12, 11));
 }
 
@@ -1224,11 +1169,11 @@ fn persistent_account_follows_fork_switch() {
     let mut executor =
         Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
     Arc::make_mut(&mut executor.registry).persistent.insert(COUNTER);
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
 
-    executor.run(&[select(1), INC], Mode::Commit);
+    executor.run(&[select(1), INC]);
     assert_eq!(counter(&executor, 1), 12);
-    executor.run(&[select(0), INC], Mode::Commit);
+    executor.run(&[select(0), INC]);
     assert_eq!(counter(&executor, 0), 13);
 }
 
@@ -1243,9 +1188,9 @@ fn persistent_account_unchanged_by_transaction_survives_commit() {
     Arc::make_mut(&mut executor.registry).persistent.insert(DEPLOYED);
 
     // Both calls change the slot, but none changes the account with the code.
-    executor.run(&[(DEPLOYED, &[]), select(1), (DEPLOYED, &[])], Mode::Commit);
+    executor.run(&[(DEPLOYED, &[]), select(1), (DEPLOYED, &[])]);
     assert_eq!(deployed(&executor), 2);
-    executor.run(&[(DEPLOYED, &[])], Mode::Commit);
+    executor.run(&[(DEPLOYED, &[])]);
     assert_eq!(deployed(&executor), 3);
 }
 
@@ -1254,7 +1199,7 @@ fn persistent_account_unchanged_by_transaction_survives_commit() {
 fn snapshot_restore_reverts_persistent_accounts() {
     let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
     Arc::make_mut(&mut executor.registry).persistent.insert(COUNTER);
-    executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (CHEATS, &[REVERT_TO, 0])]);
     assert_eq!(counter(&executor, 0), 10);
 }
 
@@ -1267,24 +1212,24 @@ fn snapshot_restore_leaves_other_forks() {
 
     // B's write was committed while B was active, and B is still active at the restore.
     let mut executor = new();
-    executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
-    executor.run(&[INC, select(1), INC], Mode::Commit);
-    executor.run(&[(CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    executor.run(&[(CHEATS, &[SNAPSHOT])]);
+    executor.run(&[INC, select(1), INC]);
+    executor.run(&[(CHEATS, &[REVERT_TO, 0])]);
     assert_eq!(executor.registry.active, 0);
     assert_eq!(counters(&executor), (10, 21));
 
     // B's write was committed while B was inactive.
     let mut executor = new();
-    executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
-    executor.run(&[INC, select(1), INC, select(0)], Mode::Commit);
-    executor.run(&[(CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    executor.run(&[(CHEATS, &[SNAPSHOT])]);
+    executor.run(&[INC, select(1), INC, select(0)]);
+    executor.run(&[(CHEATS, &[REVERT_TO, 0])]);
     assert_eq!(counters(&executor), (10, 21));
 
     // B's write is still pending in its saved state when A's snapshot is restored.
     let mut executor = new();
     let script: &[(Address, &[u8])] =
         &[(CHEATS, &[SNAPSHOT]), INC, select(1), INC, select(0), (CHEATS, &[REVERT_TO, 0])];
-    executor.run(script, Mode::Commit);
+    executor.run(script);
     assert_eq!(counters(&executor), (10, 21));
 }
 
@@ -1296,14 +1241,14 @@ fn snapshot_restore_drops_writes_since_left_fork_was_selected() {
 
     // B was selected in this transaction.
     let mut executor = new();
-    executor.run(&[(CHEATS, &[SNAPSHOT]), select(1), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    executor.run(&[(CHEATS, &[SNAPSHOT]), select(1), INC, (CHEATS, &[REVERT_TO, 0])]);
     assert_eq!(executor.registry.active, 0);
     assert_eq!(counter(&executor, 1), 20);
 
     // B was selected in an earlier call.
     let mut executor = new();
-    executor.run(&[(CHEATS, &[SNAPSHOT]), select(1)], Mode::Commit);
-    executor.run(&[INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    executor.run(&[(CHEATS, &[SNAPSHOT]), select(1)]);
+    executor.run(&[INC, (CHEATS, &[REVERT_TO, 0])]);
     assert_eq!(counter(&executor, 1), 20);
 
     // B's write from an earlier selection stays pending; only the one since it was reselected is
@@ -1318,24 +1263,19 @@ fn snapshot_restore_drops_writes_since_left_fork_was_selected() {
         INC,
         (CHEATS, &[REVERT_TO, 0]),
     ];
-    executor.run(script, Mode::Commit);
+    executor.run(script);
     assert_eq!(counter(&executor, 1), 21);
 
     // `vm.transact` writes B's overlay, as Foundry writes the fork's database, so it stays.
     let mut executor = new();
     let script: &[(Address, &[u8])] =
         &[(CHEATS, &[SNAPSHOT]), select(1), (CHEATS, &[TRANSACT, 0]), (CHEATS, &[REVERT_TO, 0])];
-    executor.run(script, Mode::Commit);
+    executor.run(script);
     assert_eq!(counter(&executor, 1), 21);
 }
 
 #[test]
-fn speculative_call_restores_registry_after_fork_switch_and_snapshot_restore() {
-    let mut executor =
-        Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
-    executor.run(&[INC, (CHEATS, &[SNAPSHOT])], Mode::Commit);
-    assert_eq!(executor.registry.snapshots.len(), 1);
-
+fn speculative_call_leaves_registry_after_fork_switch_and_snapshot_restore() {
     let script: &[(Address, &[u8])] = &[
         INC,
         select(1),
@@ -1346,56 +1286,74 @@ fn speculative_call_restores_registry_after_fork_switch_and_snapshot_restore() {
         select(0),
         INC,
     ];
-    // Control: committed, the script switches forks, snapshots, and restores as intended.
-    let mut control = executor.clone();
-    control.run(script, Mode::Commit);
-    assert_eq!(control.registry.snapshots.len(), 2);
-    assert_eq!((counter(&control, 0), counter(&control, 1)), (13, 21));
+    for isolate in [false, true] {
+        let mut executor = executor_with(&[]);
+        executor.isolate = isolate;
+        executor.run(&[INC, (CHEATS, &[SNAPSHOT])]);
+        assert_eq!(executor.registry.snapshots.len(), 1);
 
-    executor.run(script, Mode::Discard);
-    assert_eq!(executor.registry.active, 0);
-    assert_eq!(executor.registry.snapshots.len(), 1);
-    assert_eq!((counter(&executor, 0), counter(&executor, 1)), (11, 20));
+        // Control: committed, the script switches forks, snapshots, and restores as intended.
+        let mut control = executor.clone();
+        control.run(script);
+        assert_eq!(control.registry.snapshots.len(), 2, "isolate: {isolate}");
+        assert_eq!((counter(&control, 0), counter(&control, 1)), (13, 21), "isolate: {isolate}");
+
+        executor.set_code(TEST, returning_script_code(script));
+        let (output, cheats) = executor.call();
+        assert_eq!(Word::from_be_slice(&output), Word::from(13), "isolate: {isolate}");
+        assert_eq!(cheats.registry.snapshots.len(), 2, "isolate: {isolate}");
+        drop(cheats);
+        assert_eq!(executor.registry.active, 0, "isolate: {isolate}");
+        assert_eq!(executor.registry.snapshots.len(), 1, "isolate: {isolate}");
+        assert_eq!((counter(&executor, 0), counter(&executor, 1)), (11, 20), "isolate: {isolate}");
+    }
 }
 
-/// Gap: capturing only the registry and saved forks, as the issue says, is not enough.
+/// Without a fork switch, an overlay write or a snapshot restore on the start fork still works on
+/// the call's copy of the accepted overlay. The call sees setUp's write, its own write, and the
+/// restored state, and the executor keeps none of them: `vm.transact` in one test doesn't leak
+/// into the next, and restoring an older snapshot doesn't drop setUp's committed write.
 #[test]
-fn speculative_call_without_start_overlay_capture_leaks() {
-    // An overlay write on the start fork survives the discard.
-    let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.capture_start_overlay = false;
-    executor.run(&[(CHEATS, &[TRANSACT, 0])], Mode::Discard);
-    assert_eq!(counter(&executor, 0), 11, "vm.transact in a test leaked into the next test");
+fn speculative_call_copies_shared_overlay_for_start_fork_write_or_restore() {
+    let scripts: [&[(Address, &[u8])]; 3] = [
+        &[(CHEATS, &[TRANSACT, 0]), INC],
+        &[(CHEATS, &[REVERT_TO, 0]), INC],
+        &[(CHEATS, &[TRANSACT, 0]), (CHEATS, &[REVERT_TO, 0]), INC],
+    ];
+    for (script, expected) in scripts.into_iter().zip([13, 11, 11]) {
+        for isolate in [false, true] {
+            let mut executor = executor_with(&[]);
+            executor.isolate = isolate;
+            executor.run(&[(CHEATS, &[SNAPSHOT])]);
+            executor.run(&[INC]);
+            let mut control = executor.clone();
+            control.run(script);
+            assert_eq!(counter(&control, 0), expected, "{script:?}, isolate: {isolate}");
 
-    // Restoring an older snapshot replaces the start fork's accepted overlay.
-    let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.capture_start_overlay = false;
-    executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
-    executor.run(&[INC], Mode::Commit);
-    executor.run(&[(CHEATS, &[REVERT_TO, 0])], Mode::Discard);
-    assert_eq!(counter(&executor, 0), 10, "setUp's committed write was lost");
-
-    // Capturing the start fork's overlay at the first mutation fixes both.
-    let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.run(&[(CHEATS, &[SNAPSHOT])], Mode::Commit);
-    executor.run(&[INC], Mode::Commit);
-    executor.run(&[(CHEATS, &[TRANSACT, 0]), (CHEATS, &[REVERT_TO, 0])], Mode::Discard);
-    assert_eq!(counter(&executor, 0), 11);
-
-    // An overlay write alone, with no registry mutation, is restored too.
-    executor.run(&[(CHEATS, &[TRANSACT, 0])], Mode::Discard);
-    assert_eq!(counter(&executor, 0), 11);
+            executor.set_code(TEST, returning_script_code(script));
+            let (output, cheats) = executor.call();
+            assert_eq!(
+                Word::from_be_slice(&output),
+                Word::from(expected),
+                "{script:?}, isolate: {isolate}"
+            );
+            assert!(cheats.shared_overlay.is_none(), "{script:?}, isolate: {isolate}");
+            drop(cheats);
+            assert_eq!(executor.registry.snapshots.len(), 1, "{script:?}, isolate: {isolate}");
+            assert_eq!(counter(&executor, 0), 11, "{script:?}, isolate: {isolate}");
+        }
+    }
 }
 
 #[test]
 fn isolated_child_shares_overlay_by_move() {
     let backing = BackingDb::with_counter(10);
     let mut executor = Executor::new(vec![backing.clone()]);
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
     executor.isolate = true;
     let reads = backing.reads();
 
-    executor.run(&[INC, INC], Mode::Commit);
+    executor.run(&[INC, INC]);
     // The second child starts from the first child's merged write.
     assert_eq!(counter(&executor, 0), 13);
     assert_eq!(executor.parent_overlay_moved, [true, true]);
@@ -1411,7 +1369,7 @@ fn isolated_child_dispatches_cheatcodes() {
             executor_with(&[(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT]), select(1), INC]))]);
         executor.isolate = isolate;
 
-        executor.run(&[(HANDLER, &[]), INC], Mode::Commit);
+        executor.run(&[(HANDLER, &[]), INC]);
         assert_eq!(executor.registry.snapshots.len(), 1, "isolate: {isolate}");
         assert_eq!(executor.registry.active, 1, "isolate: {isolate}");
         assert_eq!((counter(&executor, 0), counter(&executor, 1)), (10, 22), "isolate: {isolate}");
@@ -1431,7 +1389,7 @@ fn isolated_child_restore_drops_parent_writes_since_snapshot() {
         )]);
         executor.isolate = isolate;
 
-        executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[])], Mode::Commit);
+        executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[])]);
         assert_eq!(counter(&executor, 0), 10, "isolate: {isolate}");
         assert_eq!(
             executor.storage(0, COLD_COUNTER, Word::ZERO),
@@ -1449,7 +1407,7 @@ fn reverted_restore_in_isolated_child_does_not_escape() {
         executor_with(&[(FAILING, reverting_script_code(&[INC, (CHEATS, &[REVERT_TO, 0])]))]);
     executor.isolate = true;
 
-    executor.run(&[INC, (CHEATS, &[SNAPSHOT]), INC, (FAILING, &[])], Mode::Commit);
+    executor.run(&[INC, (CHEATS, &[SNAPSHOT]), INC, (FAILING, &[])]);
     assert_eq!(counter(&executor, 0), 12);
 }
 
@@ -1463,7 +1421,7 @@ fn caught_reverted_restore_in_isolated_child_is_undone() {
     ]);
     executor.isolate = true;
 
-    executor.run(&[INC, (CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[])], Mode::Commit);
+    executor.run(&[INC, (CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[])]);
     assert_eq!(counter(&executor, 0), 13);
 }
 
@@ -1479,7 +1437,7 @@ fn isolated_child_restore_survives_reverted_sibling() {
     executor.isolate = true;
 
     // 11 after the restore, which undid 13.
-    executor.run(&[(HANDLER, &[])], Mode::Commit);
+    executor.run(&[(HANDLER, &[])]);
     assert_eq!(counter(&executor, 0), 12);
 }
 
@@ -1594,9 +1552,9 @@ fn failed_root_drops_isolated_writes() {
     for script in scripts {
         let counters = [false, true].map(|isolate| {
             let mut executor = executor_with(&[]);
-            executor.run(&[INC], Mode::Commit);
+            executor.run(&[INC]);
             executor.isolate = isolate;
-            let result = executor.run_code(reverting_script_code(script), Mode::Commit);
+            let result = executor.run_code(reverting_script_code(script));
             assert!(!result.status);
             (counter(&executor, 0), nonce(&executor))
         });
@@ -1619,9 +1577,9 @@ fn failed_root_after_fork_switch() {
     for (script, active) in scripts {
         let results = [false, true].map(|isolate| {
             let mut executor = executor_with(&[]);
-            executor.run(&[INC], Mode::Commit);
+            executor.run(&[INC]);
             executor.isolate = isolate;
-            let result = executor.run_code(reverting_script_code(script), Mode::Commit);
+            let result = executor.run_code(reverting_script_code(script));
             assert!(!result.status);
             (
                 executor.registry.active,
@@ -1639,12 +1597,11 @@ fn failed_root_after_fork_switch() {
 fn failed_root_after_restore_on_another_fork() {
     for isolate in [false, true] {
         let mut executor = executor_with(&[]);
-        executor.run(&[select(1), INC], Mode::Commit);
-        executor.run(&[(CHEATS, &[SNAPSHOT]), select(0)], Mode::Commit);
+        executor.run(&[select(1), INC]);
+        executor.run(&[(CHEATS, &[SNAPSHOT]), select(0)]);
         executor.isolate = isolate;
 
-        let result = executor
-            .run_code(reverting_script_code(&[(CHEATS, &[REVERT_TO, 0]), INC]), Mode::Commit);
+        let result = executor.run_code(reverting_script_code(&[(CHEATS, &[REVERT_TO, 0]), INC]));
         assert!(!result.status);
         let results = (executor.registry.active, counter(&executor, 0), counter(&executor, 1));
         assert_eq!(results, (1, 10, 21), "isolate: {isolate}");
@@ -1658,20 +1615,20 @@ fn staged_write_mid_transaction() {
 
     // The nested transaction sees the in-flight write and is accepted at once; the live layer is
     // refreshed, so the next increment continues from it.
-    executor.run(&[INC, (CHEATS, &[TRANSACT, 0]), INC], Mode::Commit);
+    executor.run(&[INC, (CHEATS, &[TRANSACT, 0]), INC]);
     assert_eq!(counter(&executor, 0), 13);
 
     // A failed read inside the nested transaction publishes nothing.
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
     backing.fail_storage(true);
-    executor.run(&[(CHEATS, &[TRANSACT, 1])], Mode::Commit);
+    executor.run(&[(CHEATS, &[TRANSACT, 1])]);
     backing.fail_storage(false);
     assert_eq!(executor.storage(0, COLD_COUNTER, Word::ZERO), Word::from(10));
     assert_eq!(executor.accepted(0, COLD_COUNTER, Word::ZERO), None);
     assert_eq!(counter(&executor, 0), 14);
 
     // Control: the same nested transaction publishes once reads succeed.
-    executor.run(&[(CHEATS, &[TRANSACT, 1])], Mode::Commit);
+    executor.run(&[(CHEATS, &[TRANSACT, 1])]);
     assert_eq!(executor.accepted(0, COLD_COUNTER, Word::ZERO), Some(Word::from(11)));
 }
 
@@ -1775,14 +1732,16 @@ fn state_write_mid_transaction_is_kept() {
     let results = [&[INC, (CHEATS, &[STATE_WRITE]), INC][..], &[(CHEATS, &[STATE_WRITE]), INC]]
         .map(|script| {
             let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-            executor.run(script, Mode::Commit);
+            executor.run(script);
             counter(&executor, 0)
         });
     assert_eq!(results, [101, 101], "slot loaded before the write, not loaded");
 
-    // Like any write in the transaction, a discarded call drops it.
+    // Like any write in the transaction, a speculative call sees it and drops it.
     let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.run(&[INC, (CHEATS, &[STATE_WRITE])], Mode::Discard);
+    executor.set_code(TEST, returning_script_code(&[INC, (CHEATS, &[STATE_WRITE]), INC]));
+    let (output, _) = executor.call();
+    assert_eq!(Word::from_be_slice(&output), Word::from(101));
     assert_eq!(counter(&executor, 0), 10);
 }
 
@@ -1837,7 +1796,7 @@ impl DynDatabase for AcceptedView {
 fn speculative_call_shares_executor_state() {
     let backing = BackingDb::with_counter(10);
     let mut executor = Executor::new(vec![backing.clone()]);
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
     executor.set_code(TEST, returning_script_code(&[INC]));
     let reads = backing.reads();
 
@@ -1861,10 +1820,10 @@ fn speculative_call_copies_shared_state_at_first_mutation() {
     for isolate in [false, true] {
         let mut executor = executor_with(&[]);
         executor.isolate = isolate;
-        executor.run(&[INC], Mode::Commit);
+        executor.run(&[INC]);
         // Control: the same script, committed by a call that owns the state.
         let mut control = executor.clone();
-        control.run(script, Mode::Commit);
+        control.run(script);
         assert_eq!((counter(&control, 0), counter(&control, 1)), (12, 21), "isolate: {isolate}");
 
         executor.set_code(TEST, returning_script_code(script));
@@ -1889,9 +1848,9 @@ fn speculative_call_copies_shared_state_in_isolated_child() {
         script_code(&[(CHEATS, &[SNAPSHOT]), select(1), INC, select(0)]),
     )]);
     executor.isolate = true;
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
     let mut control = executor.clone();
-    control.run(script, Mode::Commit);
+    control.run(script);
     assert_eq!((counter(&control, 0), counter(&control, 1)), (12, 21));
 
     executor.set_code(TEST, returning_script_code(script));
@@ -1919,7 +1878,7 @@ fn speculative_call_copies_only_registry_for_registry_op() {
     for isolate in [false, true] {
         let mut executor = executor_with(&[(HANDLER, script_code(&[PERSIST_COUNTER]))]);
         executor.isolate = isolate;
-        executor.run(&[INC, (CHEATS, &[SNAPSHOT])], Mode::Commit);
+        executor.run(&[INC, (CHEATS, &[SNAPSHOT])]);
 
         executor.set_code(TEST, returning_script_code(script));
         let (output, cheats) = executor.call();
@@ -1937,15 +1896,15 @@ fn speculative_call_copies_only_registry_for_registry_op() {
 }
 
 /// A fork switch after a registry-only cheatcode still copies the overlay before it saves the
-/// start fork, and the account made persistent follows the switch. Shared or owned, the
-/// speculative call leaves the registry and both forks as they were.
+/// start fork, and the account made persistent follows the switch. The speculative call leaves the
+/// registry and both forks as they were.
 #[test]
 fn speculative_call_after_registry_op_switches_forks() {
     let script: &[(Address, &[u8])] = &[PERSIST_COUNTER, select(1), INC];
     let mut executor = executor_with(&[]);
-    executor.run(&[INC], Mode::Commit);
+    executor.run(&[INC]);
     let mut control = executor.clone();
-    control.run(script, Mode::Commit);
+    control.run(script);
     assert_eq!((counter(&control, 0), counter(&control, 1)), (11, 12));
 
     executor.set_code(TEST, returning_script_code(script));
@@ -1953,15 +1912,9 @@ fn speculative_call_after_registry_op_switches_forks() {
     assert_eq!(Word::from_be_slice(&output), Word::from(12));
     assert!(cheats.shared_overlay.is_none());
     drop(cheats);
-
-    let mut owned = executor.clone();
-    owned.run(&[PERSIST_COUNTER], Mode::Discard);
-    owned.run(script, Mode::Discard);
-    for executor in [&executor, &owned] {
-        assert!(!executor.registry.persistent.contains(&COUNTER));
-        assert_eq!(executor.registry.active, 0);
-        assert_eq!((counter(executor, 0), counter(executor, 1)), (11, 20));
-    }
+    assert!(!executor.registry.persistent.contains(&COUNTER));
+    assert_eq!(executor.registry.active, 0);
+    assert_eq!((counter(&executor, 0), counter(&executor, 1)), (11, 20));
 }
 
 /// Logs belong to the transaction, not to a fork: master keeps one journal across fork switches.
