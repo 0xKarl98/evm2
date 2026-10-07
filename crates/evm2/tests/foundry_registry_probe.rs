@@ -259,6 +259,8 @@ struct Cheats {
     child_calls: Vec<ChildCall>,
     /// Whether the parent's overlay was empty while the isolated child ran.
     parent_overlay_moved: Vec<bool>,
+    /// Gas each isolated child spent.
+    child_gas: Vec<u64>,
     /// The state each fork the root frame touched had when the root started, without the overlay
     /// cache, starting with the start fork. Like master's `top_frame_journal`, but for every fork
     /// and in plain mode too. Other forks are recorded when the root first selects them.
@@ -284,6 +286,7 @@ impl Default for Cheats {
             child_restores: Vec::new(),
             child_calls: Vec::new(),
             parent_overlay_moved: Vec::new(),
+            child_gas: Vec::new(),
             root_start: Vec::new(),
         }
     }
@@ -529,6 +532,7 @@ impl Cheats {
         self.parent_overlay_moved.push(moved);
         match result {
             Ok(out) => {
+                self.child_gas.push(out.result.total_gas_spent);
                 let success = out.result.status;
                 if self.registry.active != source_fork || (success && restored) {
                     // The child's state replaces the parent's after a fork switch, as in master.
@@ -766,6 +770,7 @@ struct Executor {
     isolate: bool,
     rebase: Rebase,
     parent_overlay_moved: Vec<bool>,
+    child_gas: Vec<u64>,
 }
 
 impl Executor {
@@ -784,6 +789,7 @@ impl Executor {
             isolate: false,
             rebase: Rebase::Adapter,
             parent_overlay_moved: Vec::new(),
+            child_gas: Vec::new(),
         }
     }
 
@@ -836,6 +842,7 @@ impl Executor {
     fn finish(&mut self, cheats: Cheats, state: State<'_>, mode: Mode) {
         let Cheats { mut registry, start_fork, captured, captured_start_cache, .. } = cheats;
         self.parent_overlay_moved.extend(cheats.parent_overlay_moved);
+        self.child_gas.extend(cheats.child_gas);
         if let Some(captured) = captured {
             // Speculative call that mutated the registry: restore it and recover the start fork.
             let mut start = if registry.active == start_fork {
@@ -1053,6 +1060,16 @@ fn counter_after(
     }
     executor.run(script, Mode::Commit);
     counter(&executor, 0)
+}
+
+/// Runs `script` isolated with `rebase` and `handler` at [`HANDLER`], and returns the root's gas.
+fn run_isolated(handler: Bytecode, script: &[(Address, &[u8])], rebase: Rebase) -> (Executor, u64) {
+    let mut executor = executor_with(&[(HANDLER, handler)]);
+    executor.isolate = true;
+    executor.rebase = rebase;
+    let result = executor.run_code(script_code(script), Mode::Commit);
+    assert!(result.status, "test call failed: {result:?}");
+    (executor, result.total_gas_spent)
 }
 
 fn counter(executor: &Executor, fork: usize) -> u64 {
@@ -1472,6 +1489,40 @@ fn rebase_skipped_after_restore_in_isolated_child() {
     let script: &[(Address, &[u8])] =
         &[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 1])];
     assert_eq!(counter_after(&contracts, script, Some(Rebase::Adapter)), 11);
+}
+
+/// Rebasing through public API changes metadata, and gas with it. [`rebase_isolated_originals`]
+/// gives an account the parent wrote the parent's warmth, where master keeps the child's, as
+/// [`Rebase::Off`] does. Restored in the parent, the snapshot leaves `COUNTER` warm, so calling it
+/// costs 2,500 gas less. Restored in the child, `INC` also reads a warm slot (2,000 less), and its
+/// write sees the parent's original rather than the child's (2,800 less), which any rebase of the
+/// originals, an evm2 one included, would change too.
+#[test]
+fn rebased_capture_takes_parent_warmth() {
+    let snapshot = || script_code(&[(CHEATS, &[SNAPSHOT])]);
+    let restore_in_child = || script_code(&[(CHEATS, &[SNAPSHOT]), (CHEATS, &[REVERT_TO, 0]), INC]);
+    let [off, adapter] = [Rebase::Off, Rebase::Adapter].map(|rebase| {
+        let (executor, _) = run_isolated(snapshot(), &[INC, (HANDLER, &[])], rebase);
+        let snapshot_state = executor.registry.snapshots[0].active_state.clone();
+        let mut state = snapshot_state.into_state(EmptyDB::default());
+        let account_warm = state.account(&COUNTER).unwrap().is_warm();
+        let warm = (account_warm, state.storage(&COUNTER).is_warm(&Word::ZERO));
+        let original = state.storage_slot(&COUNTER, Word::ZERO).unwrap().original();
+
+        let script = [INC, (HANDLER, &[]), (CHEATS, &[REVERT_TO, 0]), INC];
+        let (in_parent, root_gas) = run_isolated(snapshot(), &script, rebase);
+        let (in_child, _) = run_isolated(restore_in_child(), &[INC, (HANDLER, &[])], rebase);
+        assert_eq!([counter(&in_parent, 0), counter(&in_child, 0)], [12, 12]);
+        (warm, original.to::<u64>(), root_gas, in_child.child_gas[1])
+    });
+    assert_eq!((off.0, off.1), ((false, false), 11), "account and slot warmth, original");
+    assert_eq!((adapter.0, adapter.1), ((true, true), 10), "account and slot warmth, original");
+    assert_eq!(off.2 - adapter.2, 2_500, "root: warm call");
+    assert_eq!(
+        off.3 - adapter.3,
+        2_500 + 2_000 + 2_800,
+        "child: warm call, warm read, dirty write"
+    );
 }
 
 /// A failed root frame drops the isolated children's writes, also after a snapshot restore in the
