@@ -23,7 +23,7 @@ use evm2::{
     ethereum::{TxEnvelope, ethereum_tx_registry},
     evm::{
         AccountInfo, Cache, DbResult, DynDatabase, EmptyDB, PendingState, State, StateCheckpoint,
-        StateSnapshot,
+        StateSnapshot, TxResult,
     },
     interpreter::{GasTracker, InstrStop, Interpreter, Message, MessageResult, Word, op},
 };
@@ -257,6 +257,10 @@ struct Cheats {
     child_calls: Vec<ChildCall>,
     /// Whether the parent's overlay was empty while the isolated child ran.
     parent_overlay_moved: Vec<bool>,
+    /// The state each fork the root frame touched had when the root started, without the overlay
+    /// cache, starting with the start fork. Like master's `top_frame_journal`, but for every fork
+    /// and in plain mode too. Other forks are recorded when the root first selects them.
+    root_start: Vec<(usize, StateSnapshot)>,
 }
 
 /// The placeholder left in the parent while the isolated child runs the inspector.
@@ -277,6 +281,7 @@ impl Default for Cheats {
             child_restores: Vec::new(),
             child_calls: Vec::new(),
             parent_overlay_moved: Vec::new(),
+            root_start: Vec::new(),
         }
     }
 }
@@ -302,6 +307,11 @@ impl Inspector<BaseEvmTypes> for Cheats {
         interp: &mut Interpreter<'_, '_, BaseEvmTypes>,
         message: &mut Message<BaseEvmTypes>,
     ) -> Option<MessageResult<BaseEvmTypes>> {
+        // An isolated child's root frame has depth 0 too.
+        if !self.in_child && message.depth == 0 {
+            let start = SavedState::rest_of(interp.host().state_mut());
+            self.root_start = vec![(self.registry.active, start)];
+        }
         if message.destination == CHEATS {
             let output = self.dispatch(interp.host(), &message.input);
             return Some(message_result(message, output.is_some(), output.unwrap_or_default()));
@@ -324,6 +334,9 @@ impl Inspector<BaseEvmTypes> for Cheats {
     ) {
         if self.in_child && message.destination != CHEATS {
             self.finish_child_call(interp.host(), result.is_success());
+        }
+        if !self.in_child && message.depth == 0 && !result.is_success() {
+            self.restore_root(interp.host());
         }
     }
 }
@@ -418,6 +431,7 @@ impl Cheats {
         if self.registry.active == fork {
             return;
         }
+        self.record_root_start(fork);
         let incoming =
             self.registry_mut().forks[fork].saved.take().expect("inactive fork is saved");
         let mut outgoing =
@@ -448,6 +462,9 @@ impl Cheats {
     fn revert_to(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, id: usize) {
         let RegistrySnapshot { active, active_state, selected } =
             self.registry.snapshots[id].clone();
+        if active != self.registry.active {
+            self.record_root_start(active);
+        }
         let restored = active_state.into_state(self.registry.backing(active));
         let mut left = mem::replace(evm.state_mut(), restored);
         let left_selected = mem::replace(&mut self.selected, selected);
@@ -540,6 +557,48 @@ impl Cheats {
         state.rollback(call.checkpoint, evm.version().features);
         *evm.state_mut() = state;
         self.selected = selected;
+    }
+
+    /// Records the state of the inactive `fork` before the root frame first changes it.
+    fn record_root_start(&mut self, fork: usize) {
+        if self.root_start.iter().any(|(recorded, _)| *recorded == fork) {
+            return;
+        }
+        let saved = self.registry.forks[fork].saved.as_ref().expect("inactive fork is saved");
+        self.root_start.push((fork, saved.rest.clone()));
+    }
+
+    /// Puts back the state that each fork the failed root frame touched had when the root started,
+    /// keeping their accepted overlays, like master's `top_level_frame_end`.
+    ///
+    /// evm2 rolled back only the live fork's journal, which doesn't record the isolated children's
+    /// writes, and a fork the root left was saved with its writes. Fork selections and snapshot
+    /// restores stay in effect, as master's backend keeps them. If the root ends on another fork,
+    /// it gets the persistent accounts as they were when the root started, as a switch then would
+    /// have given it.
+    fn restore_root(&mut self, evm: &mut Evm<'_, BaseEvmTypes>) {
+        let root_start = mem::take(&mut self.root_start);
+        let active = self.registry.active;
+        let start = (active != self.start_fork)
+            .then(|| root_start[0].1.clone().into_state(EmptyDB::default()));
+        for (fork, rest) in root_start {
+            if fork == active {
+                let mut state = rest.into_state(EmptyDB::default());
+                mem::swap(state.overlay_db_mut(), evm.overlay_db_mut());
+                *evm.state_mut() = state;
+            } else {
+                self.registry_mut().forks[fork]
+                    .saved
+                    .as_mut()
+                    .expect("inactive fork is saved")
+                    .rest = rest;
+            }
+        }
+        if let Some(start) = start {
+            for address in &self.registry.persistent {
+                evm.state_mut().merge_transaction_account_from(address, &start);
+            }
+        }
     }
 
     /// The parent's state, while an isolated child that started on `fork` runs.
@@ -676,7 +735,13 @@ impl Executor {
 
     /// Calls the test contract running `script`.
     fn run(&mut self, script: &[(Address, &[u8])], mode: Mode) {
-        self.set_code(TEST, script_code(script));
+        let result = self.run_code(script_code(script), mode);
+        assert!(result.status, "test call failed: {result:?}");
+    }
+
+    /// Calls the test contract with `code`, which may fail.
+    fn run_code(&mut self, code: Bytecode, mode: Mode) -> TxResult<BaseEvmTypes> {
+        self.set_code(TEST, code);
         let active = self.registry.active;
         let mut evm = new_evm(EmptyDB::default());
         let state = self.active.take().unwrap();
@@ -701,7 +766,7 @@ impl Executor {
         let cheats = *evm.clear_inspector_as::<Cheats>().unwrap();
         let state = mem::replace(evm.state_mut(), State::new(EmptyDB::default()));
         self.finish(cheats, state, mode);
-        assert!(result.status, "test call failed: {result:?}");
+        result
     }
 
     fn finish(&mut self, cheats: Cheats, state: State<'_>, mode: Mode) {
@@ -912,6 +977,13 @@ fn executor_with(contracts: &[(Address, Bytecode)]) -> Executor {
 
 fn counter(executor: &Executor, fork: usize) -> u64 {
     executor.storage(fork, COUNTER, Word::ZERO).to::<u64>()
+}
+
+/// The caller's nonce on the active fork.
+fn nonce(executor: &Executor) -> u64 {
+    let active = executor.registry.active;
+    let mut state = executor.active.clone().unwrap().load(executor.registry.backing(active));
+    state.account_info_untracked(&CALLER).unwrap().unwrap().nonce
 }
 
 const INC: (Address, &[u8]) = (COUNTER, &[]);
@@ -1282,6 +1354,74 @@ fn state_captured_in_isolated_child_keeps_parent_writes() {
         counter(&executor, 0)
     });
     assert_eq!(left, [11, 11], "plain, isolated");
+}
+
+/// A failed root frame drops the isolated children's writes, also after a snapshot restore in the
+/// root. evm2 rolls the root back through the journal, which `merge_isolated_state` doesn't record,
+/// so the root puts back the state it started with, like master's `top_frame_journal`. The caller's
+/// nonce, bumped before the root, stays.
+#[test]
+fn failed_root_drops_isolated_writes() {
+    let scripts: [&[(Address, &[u8])]; 2] =
+        [&[INC, INC], &[(CHEATS, &[SNAPSHOT]), INC, (CHEATS, &[REVERT_TO, 0]), INC]];
+    for script in scripts {
+        let counters = [false, true].map(|isolate| {
+            let mut executor = executor_with(&[]);
+            executor.run(&[INC], Mode::Commit);
+            executor.isolate = isolate;
+            let result = executor.run_code(reverting_script_code(script), Mode::Commit);
+            assert!(!result.status);
+            (counter(&executor, 0), nonce(&executor))
+        });
+        assert_eq!(counters, [(11, 2), (11, 2)], "plain, isolated: {script:?}");
+    }
+}
+
+/// A failed root frame drops its writes on every fork it switched between, and the fork it ends on
+/// gets the persistent accounts as they were when the root started, as a switch then would have.
+/// Fork selections stay. evm2 rolls back only the live fork's journal, so this needs the captured
+/// state in plain mode too: a fork the root leaves is saved with its writes.
+#[test]
+fn failed_root_after_fork_switch() {
+    let scripts = [
+        (&[INC, select(1)] as &[_], 1),
+        (&[select(1), INC], 1),
+        (&[INC, select(1), INC], 1),
+        (&[INC, select(1), INC, select(0)], 0),
+    ];
+    for (script, active) in scripts {
+        let results = [false, true].map(|isolate| {
+            let mut executor = executor_with(&[]);
+            executor.run(&[INC], Mode::Commit);
+            executor.isolate = isolate;
+            let result = executor.run_code(reverting_script_code(script), Mode::Commit);
+            assert!(!result.status);
+            (
+                executor.registry.active,
+                counter(&executor, 0),
+                counter(&executor, 1),
+                nonce(&executor),
+            )
+        });
+        assert_eq!(results, [(active, 11, 20, 2); 2], "plain, isolated: {script:?}");
+    }
+}
+
+/// A failed root also drops its writes on a fork that a snapshot restore switched to.
+#[test]
+fn failed_root_after_restore_on_another_fork() {
+    for isolate in [false, true] {
+        let mut executor = executor_with(&[]);
+        executor.run(&[select(1), INC], Mode::Commit);
+        executor.run(&[(CHEATS, &[SNAPSHOT]), select(0)], Mode::Commit);
+        executor.isolate = isolate;
+
+        let result = executor
+            .run_code(reverting_script_code(&[(CHEATS, &[REVERT_TO, 0]), INC]), Mode::Commit);
+        assert!(!result.status);
+        let results = (executor.registry.active, counter(&executor, 0), counter(&executor, 1));
+        assert_eq!(results, (1, 10, 21), "isolate: {isolate}");
+    }
 }
 
 #[test]
