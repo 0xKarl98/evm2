@@ -39,6 +39,8 @@ const TEST: Address = Address::with_last_byte(0x7e);
 const COUNTER: Address = Address::with_last_byte(0xc0);
 /// A counter whose slot is never preloaded, so reading it hits the backing database.
 const COLD_COUNTER: Address = Address::with_last_byte(0xc1);
+/// A counter that no backing database has, deployed on one fork like a `setUp` deployment.
+const DEPLOYED: Address = Address::with_last_byte(0xd0);
 /// Stand-in for the cheatcode address.
 const CHEATS: Address = Address::with_last_byte(0xcc);
 
@@ -282,6 +284,9 @@ impl Cheats {
     }
 
     /// Saves the active fork and loads `fork` into the running `Evm`.
+    ///
+    /// Persistent accounts follow the switch with both layers, as in Foundry's
+    /// `merge_account_data`: the accepted overlay entry, then the transaction layer.
     fn select_fork(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, fork: usize) {
         if self.registry.active == fork {
             return;
@@ -289,23 +294,26 @@ impl Cheats {
         let incoming = self.registry.forks[fork].saved.take().expect("inactive fork is saved");
         let outgoing = mem::replace(evm.state_mut(), incoming.load(self.registry.backing(fork)));
         for address in &self.registry.persistent {
+            merge_accepted_account(
+                &mut evm.overlay_db_mut().cache,
+                &outgoing.overlay_db().cache,
+                address,
+            );
             evm.state_mut().merge_transaction_account_from(address, &outgoing);
         }
         let active = mem::replace(&mut self.registry.active, fork);
         self.registry.forks[active].saved = Some(SavedState::save(outgoing));
     }
 
+    /// Restores every fork from the snapshot, persistent accounts included, as Foundry's
+    /// `revert_state` does.
     fn revert_to(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, id: usize) {
         let snapshot = self.registry.snapshots[id].clone();
         for (fork, saved) in self.registry.forks.iter_mut().zip(snapshot.saved) {
             fork.saved = saved;
         }
         self.registry.active = snapshot.active;
-        let restored = snapshot.active_state.into_state(self.registry.backing(snapshot.active));
-        let current = mem::replace(evm.state_mut(), restored);
-        for address in &self.registry.persistent {
-            evm.state_mut().merge_transaction_account_from(address, &current);
-        }
+        *evm.state_mut() = snapshot.active_state.into_state(self.registry.backing(snapshot.active));
     }
 
     /// Runs a nested transaction over the moved overlay and publishes it mid-transaction.
@@ -375,6 +383,29 @@ fn run_child(
         let out = child.transact(&legacy_tx(caller, to, input, gas_limit)).map_err(drop)?.detach();
         if out.result.status { Ok((out.result.output, out.pending_state)) } else { Err(()) }
     })
+}
+
+/// Merges the accepted entry of `address` in `source`, if cached, into `target`, giving it
+/// precedence as [`Cache::merge`] does: account, code, and storage, including a wipe.
+///
+/// [`State::merge_transaction_account_from`] alone is not enough. It skips accounts not loaded in
+/// this transaction, and the original values it copies come from `source`. A commit only accepts
+/// entries that differ from their original, so an entry that is loaded but unchanged would fall
+/// back to `target`'s own state once the transaction ends.
+fn merge_accepted_account(target: &mut Cache, source: &Cache, address: &Address) {
+    let mut entry = Cache::default();
+    if let Some(account) = source.accounts.get(address) {
+        if let Some(info) = account
+            && let Some(code) = source.contracts.get(&info.code_hash)
+        {
+            entry.contracts.insert(info.code_hash, code.clone());
+        }
+        entry.accounts.insert(*address, account.clone());
+    }
+    if let Some(storage) = source.storage.get(address) {
+        entry.storage.insert(*address, storage.clone());
+    }
+    target.merge(entry);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +696,47 @@ fn reselected_fork_keeps_writes_it_does_not_repeat() {
     // Rewriting one keeps the other.
     executor.run(&[select(0), INC], Mode::Commit);
     assert_eq!(counters(&executor), (12, 11));
+}
+
+/// A persistent account follows a fork switch even when the transaction hasn't loaded it, as when
+/// `setUp` committed it.
+#[test]
+fn persistent_account_follows_fork_switch() {
+    let mut executor =
+        Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
+    executor.registry.persistent.insert(COUNTER);
+    executor.run(&[INC], Mode::Commit);
+
+    executor.run(&[select(1), INC], Mode::Commit);
+    assert_eq!(counter(&executor, 1), 12);
+    executor.run(&[select(0), INC], Mode::Commit);
+    assert_eq!(counter(&executor, 0), 13);
+}
+
+/// A persistent account that the transaction loads but leaves unchanged keeps its state on the
+/// fork it was switched to, even though the commit doesn't accept it there.
+#[test]
+fn persistent_account_unchanged_by_transaction_survives_commit() {
+    let deployed = |executor: &Executor| executor.storage(1, DEPLOYED, Word::ZERO).to::<u64>();
+    let mut executor =
+        Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
+    executor.set_code(DEPLOYED, counter_code());
+    executor.registry.persistent.insert(DEPLOYED);
+
+    // Both calls change the slot, but none changes the account with the code.
+    executor.run(&[(DEPLOYED, &[]), select(1), (DEPLOYED, &[])], Mode::Commit);
+    assert_eq!(deployed(&executor), 2);
+    executor.run(&[(DEPLOYED, &[])], Mode::Commit);
+    assert_eq!(deployed(&executor), 3);
+}
+
+/// Like Foundry's `revert_state`, a snapshot restore also reverts persistent accounts.
+#[test]
+fn snapshot_restore_reverts_persistent_accounts() {
+    let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
+    executor.registry.persistent.insert(COUNTER);
+    executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
+    assert_eq!(counter(&executor, 0), 10);
 }
 
 #[test]
