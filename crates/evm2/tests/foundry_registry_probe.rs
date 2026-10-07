@@ -2,8 +2,9 @@
 //!
 //! Foundry's backend shrinks to a [`Registry`]: backing database handles, saved state of inactive
 //! forks, the snapshot registry, and persistent accounts. The [`Executor`] keeps the active fork's
-//! state between calls, builds an [`Evm`] per call, and moves the state in and out. Cheatcodes are
-//! dispatched from an [`Inspector::call`] hook, which reaches the running [`Evm`] mid-transaction.
+//! state between calls, builds an [`Evm`] per call, and moves the state in and out, except that
+//! [`Executor::call`] shares it, where master's `&self` calls borrow it. Cheatcodes are dispatched
+//! from an [`Inspector::call`] hook, which reaches the running [`Evm`] mid-transaction.
 //!
 //! Only public evm2 API is used, including [`State::rebase_isolated_originals`], which was added
 //! for the probe's isolated children. Run the measurement with
@@ -128,8 +129,9 @@ impl DynDatabase for BackingDb {
 /// A fork's state while no [`Evm`] runs it. Unlike [`State`], it is `Send`.
 #[derive(Clone, Debug)]
 struct SavedState {
-    /// Accepted overlay cache, moved out of the live state.
-    cache: Cache,
+    /// Accepted overlay cache, moved out of the live state. Shared with a running
+    /// [`Executor::call`].
+    cache: Arc<Cache>,
     /// Everything else: transaction layer, journal, logs, BAL context. Captured with an empty
     /// cache, so saving never clones the cache.
     rest: StateSnapshot,
@@ -145,13 +147,13 @@ impl SavedState {
     /// Moves the overlay cache out of `state` and captures the rest.
     fn save(mut state: State<'_>) -> Self {
         let cache = mem::take(&mut state.overlay_db_mut().cache);
-        Self { cache, rest: state.snapshot() }
+        Self { cache: Arc::new(cache), rest: state.snapshot() }
     }
 
     /// Rebuilds a live state over `db`, moving the cache back in.
     fn load<'a>(self, db: impl DynDatabase + 'a) -> State<'a> {
         let mut state = self.rest.into_state(db);
-        state.overlay_db_mut().cache = self.cache;
+        state.overlay_db_mut().cache = Arc::unwrap_or_clone(self.cache);
         state
     }
 
@@ -213,9 +215,14 @@ impl Registry {
     }
 }
 
-/// The cheatcode inspector. Owns the registry for the duration of one call.
+/// The cheatcode inspector. Owns the registry for the duration of one call, or shares it with the
+/// executor until an [`Executor::call`] first mutates it.
 struct Cheats {
-    registry: Registry,
+    /// Mutations go through [`Self::registry_mut`].
+    registry: Arc<Registry>,
+    /// The active fork's accepted overlay while an [`Executor::call`] shares it. The [`Evm`]
+    /// reads it through [`AcceptedView`], so the live overlay cache holds only this call's reads.
+    shared_overlay: Option<Arc<Cache>>,
     /// Speculative calls capture the registry before its first mutation.
     speculative: bool,
     /// The fork active when the call started.
@@ -256,7 +263,8 @@ struct Cheats {
 impl Default for Cheats {
     fn default() -> Self {
         Self {
-            registry: Registry::default(),
+            registry: Arc::default(),
+            shared_overlay: None,
             speculative: false,
             start_fork: 0,
             selected: SavedState::default().rest,
@@ -343,7 +351,7 @@ impl Cheats {
                     active_state,
                     selected: self.selected.clone(),
                 };
-                self.registry.snapshots.push(snapshot);
+                self.registry_mut().snapshots.push(snapshot);
                 Some(Bytes::new())
             }
             REVERT_TO => {
@@ -376,13 +384,26 @@ impl Cheats {
         }
     }
 
-    /// Lazily captures what a speculative call must restore.
-    fn capture(&mut self, evm: &Evm<'_, BaseEvmTypes>) {
+    /// Lazily captures what a speculative call must restore, or copies the accepted overlay that
+    /// an [`Executor::call`] shares.
+    ///
+    /// Every mutation calls this first. The first mutation always happens while the start fork is
+    /// still active.
+    fn capture(&mut self, evm: &mut Evm<'_, BaseEvmTypes>) {
+        if let Some(accepted) = self.shared_overlay.take() {
+            // Like `CowBackend::backend_mut`, but the overlay must be copied before any mutation,
+            // not just one of the registry: a snapshot or a saved fork keeps only the overlay
+            // cache and reloads it over the backing database, which would skip the shared overlay.
+            let backing = self.registry.backing(self.registry.active);
+            let overlay = evm.overlay_db_mut();
+            let reads = mem::replace(&mut overlay.cache, Cache::clone(&accepted));
+            overlay.cache.merge(reads);
+            overlay.db = Box::new(backing);
+        }
         if !self.speculative || self.captured.is_some() {
             return;
         }
-        self.captured = Some(self.registry.clone());
-        // The first mutation always happens while the start fork is still active.
+        self.captured = Some(Registry::clone(&self.registry));
         if self.capture_start_overlay {
             self.captured_start_cache = Some(evm.overlay_db().cache.clone());
         }
@@ -397,7 +418,8 @@ impl Cheats {
         if self.registry.active == fork {
             return;
         }
-        let incoming = self.registry.forks[fork].saved.take().expect("inactive fork is saved");
+        let incoming =
+            self.registry_mut().forks[fork].saved.take().expect("inactive fork is saved");
         let mut outgoing =
             mem::replace(evm.state_mut(), incoming.load(self.registry.backing(fork)));
         if let Some(base) = self.child_base(self.registry.active) {
@@ -412,8 +434,9 @@ impl Cheats {
             evm.state_mut().merge_transaction_account_from(address, &outgoing);
         }
         self.selected = SavedState::rest_of(evm.state_mut());
-        let active = mem::replace(&mut self.registry.active, fork);
-        self.registry.forks[active].saved = Some(SavedState::save(outgoing));
+        let registry = self.registry_mut();
+        let active = mem::replace(&mut registry.active, fork);
+        registry.forks[active].saved = Some(SavedState::save(outgoing));
     }
 
     /// Restores the fork the snapshot was taken on, persistent accounts included, and leaves
@@ -428,11 +451,13 @@ impl Cheats {
         let restored = active_state.into_state(self.registry.backing(active));
         let mut left = mem::replace(evm.state_mut(), restored);
         let left_selected = mem::replace(&mut self.selected, selected);
-        let left_fork = mem::replace(&mut self.registry.active, active);
+        let registry = self.registry_mut();
+        let left_fork = mem::replace(&mut registry.active, active);
         if left_fork != active {
             let cache = mem::take(&mut left.overlay_db_mut().cache);
-            self.registry.forks[left_fork].saved = Some(SavedState { cache, rest: left_selected });
-            self.registry.forks[active].saved = None;
+            registry.forks[left_fork].saved =
+                Some(SavedState { cache: Arc::new(cache), rest: left_selected });
+            registry.forks[active].saved = None;
         }
     }
 
@@ -521,6 +546,13 @@ impl Cheats {
     fn child_base(&self, fork: usize) -> Option<&State<'static>> {
         self.child_base.as_ref().filter(|(base_fork, _)| *base_fork == fork).map(|(_, base)| base)
     }
+
+    /// The registry, copied first if an [`Executor::call`] shares it. [`Self::capture`] must have
+    /// copied the shared overlay already.
+    fn registry_mut(&mut self) -> &mut Registry {
+        assert!(self.shared_overlay.is_none(), "registry mutated before capture");
+        Arc::make_mut(&mut self.registry)
+    }
 }
 
 /// Runs the parent's [`Cheats`] in an isolated child. [`Evm::clear_inspector_as`] needs a
@@ -606,7 +638,8 @@ enum Mode {
 /// Foundry-style executor: owns the registry and the active fork's state between calls.
 #[derive(Clone)]
 struct Executor {
-    registry: Registry,
+    /// Shared with a running [`Executor::call`].
+    registry: Arc<Registry>,
     /// The active fork's state while no call runs.
     active: Option<SavedState>,
     capture_start_overlay: bool,
@@ -624,7 +657,7 @@ impl Executor {
         registry.persistent.extend([CALLER, TEST]);
         let active = registry.forks[0].saved.take();
         Self {
-            registry,
+            registry: Arc::new(registry),
             active,
             capture_start_overlay: true,
             isolate: false,
@@ -679,24 +712,60 @@ impl Executor {
             let mut start = if registry.active == start_fork {
                 state
             } else {
-                registry.forks[start_fork].saved.take().unwrap().load(EmptyDB::default())
+                Arc::make_mut(&mut registry).forks[start_fork]
+                    .saved
+                    .take()
+                    .unwrap()
+                    .load(EmptyDB::default())
             };
             start.clear_transaction_state();
             if let Some(cache) = captured_start_cache {
                 start.overlay_db_mut().cache = cache;
             }
             self.active = Some(SavedState::save(start));
-            self.registry = captured;
+            self.registry = Arc::new(captured);
             return;
         }
         if mode == Mode::Commit {
             // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
-            for fork in &mut registry.forks {
+            for fork in &mut Arc::make_mut(&mut registry).forks {
                 fork.saved = fork.saved.take().map(SavedState::accept_transaction);
             }
         }
         self.active = Some(SavedState::save(state));
         self.registry = registry;
+    }
+
+    /// Calls the test contract that [`Self::set_code`] installed and discards the transaction
+    /// without touching the executor, like master's `Executor::call` over
+    /// `CowBackend::new_borrowed`.
+    ///
+    /// The call shares the registry and the active fork's accepted overlay with the executor
+    /// rather than borrowing them. Inspector hooks are generic over the [`Evm`]'s lifetime, so a
+    /// borrowing [`Cheats`] couldn't install itself in an isolated child. Neither is copied unless
+    /// a cheatcode mutates. Returns the output and the inspector, as master's `RawCallResult`
+    /// carries the cheatcodes.
+    fn call(&self) -> (Bytes, Cheats) {
+        let active = self.registry.active;
+        let state = self.active.as_ref().unwrap();
+        let view = AcceptedView {
+            cache: Arc::clone(&state.cache),
+            backing: self.registry.backing(active),
+        };
+        let mut evm = new_evm(EmptyDB::default());
+        *evm.state_mut() = state.rest.clone().into_state(view);
+        evm.set_inspector(Cheats {
+            registry: Arc::clone(&self.registry),
+            shared_overlay: Some(Arc::clone(&state.cache)),
+            start_fork: active,
+            selected: state.rest.clone(),
+            isolate: self.isolate,
+            ..Default::default()
+        });
+        let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
+        let result = executed.discard();
+        assert!(result.status, "test call failed: {result:?}");
+        (result.output, *evm.clear_inspector_as::<Cheats>().unwrap())
     }
 
     /// Reads a slot of `fork` the way executor helpers do: through the overlay and saved caches.
@@ -795,6 +864,22 @@ fn script_code(calls: &[(Address, &[u8])]) -> Bytecode {
 /// Like [`script_code`], then reverts.
 fn reverting_script_code(calls: &[(Address, &[u8])]) -> Bytecode {
     script_code_ending(calls, &[op::PUSH0, op::PUSH0, op::REVERT])
+}
+
+/// Like [`script_code`], then returns what the last call returned.
+fn returning_script_code(calls: &[(Address, &[u8])]) -> Bytecode {
+    script_code_ending(
+        calls,
+        &[
+            op::RETURNDATASIZE,
+            op::PUSH0,
+            op::PUSH0,
+            op::RETURNDATACOPY,
+            op::RETURNDATASIZE,
+            op::PUSH0,
+            op::RETURN,
+        ],
+    )
 }
 
 fn script_code_ending(calls: &[(Address, &[u8])], end: &[u8]) -> Bytecode {
@@ -915,7 +1000,7 @@ fn reselected_fork_keeps_writes_it_does_not_repeat() {
 fn persistent_account_follows_fork_switch() {
     let mut executor =
         Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
-    executor.registry.persistent.insert(COUNTER);
+    Arc::make_mut(&mut executor.registry).persistent.insert(COUNTER);
     executor.run(&[INC], Mode::Commit);
 
     executor.run(&[select(1), INC], Mode::Commit);
@@ -932,7 +1017,7 @@ fn persistent_account_unchanged_by_transaction_survives_commit() {
     let mut executor =
         Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
     executor.set_code(DEPLOYED, counter_code());
-    executor.registry.persistent.insert(DEPLOYED);
+    Arc::make_mut(&mut executor.registry).persistent.insert(DEPLOYED);
 
     // Both calls change the slot, but none changes the account with the code.
     executor.run(&[(DEPLOYED, &[]), select(1), (DEPLOYED, &[])], Mode::Commit);
@@ -945,7 +1030,7 @@ fn persistent_account_unchanged_by_transaction_survives_commit() {
 #[test]
 fn snapshot_restore_reverts_persistent_accounts() {
     let mut executor = Executor::new(vec![BackingDb::with_counter(10)]);
-    executor.registry.persistent.insert(COUNTER);
+    Arc::make_mut(&mut executor.registry).persistent.insert(COUNTER);
     executor.run(&[(CHEATS, &[SNAPSHOT]), INC, (CHEATS, &[REVERT_TO, 0])], Mode::Commit);
     assert_eq!(counter(&executor, 0), 10);
 }
@@ -1303,13 +1388,13 @@ fn overlay_write_mid_transaction_is_shadowed() {
     assert_eq!(counter(&executor, 0), 101);
 }
 
-/// The active fork's accepted overlay, borrowed read-only by a `&self` speculative call.
-struct AcceptedView<'a> {
-    cache: &'a Cache,
+/// The active fork's accepted overlay, shared read-only with an [`Executor::call`].
+struct AcceptedView {
+    cache: Arc<Cache>,
     backing: BackingDb,
 }
 
-impl DynDatabase for AcceptedView<'_> {
+impl DynDatabase for AcceptedView {
     fn get_account(&mut self, address: &Address) -> DbResult<Option<AccountInfo>> {
         match self.cache.accounts.get(address) {
             Some(account) => Ok(account.clone()),
@@ -1348,30 +1433,75 @@ impl DynDatabase for AcceptedView<'_> {
 }
 
 /// Master's speculative calls take `&self` and borrow the backend (`CowBackend::new_borrowed`).
-/// Moving the overlay in and out needs `&mut self`; a borrowed view keeps `&self` without a clone
-/// until the first cheatcode mutation, which materializes the overlay like `CowBackend`.
+/// [`Executor::call`] takes `&self` too and shares the state: a call without cheatcode mutations
+/// reads the accepted overlay in place and copies neither it nor the registry.
 #[test]
-fn speculative_call_borrows_accepted_overlay() {
+fn speculative_call_shares_executor_state() {
     let backing = BackingDb::with_counter(10);
     let mut executor = Executor::new(vec![backing.clone()]);
     executor.run(&[INC], Mode::Commit);
-    let executor = &executor;
-    let accepted = &executor.active.as_ref().unwrap().cache;
+    executor.set_code(TEST, returning_script_code(&[INC]));
     let reads = backing.reads();
 
-    let mut evm = new_evm(AcceptedView { cache: accepted, backing: backing.clone() });
-    let tx = legacy_tx(CALLER, COUNTER, Bytes::new(), 100_000);
-    let result = evm.transact(&tx).unwrap().discard();
-    assert_eq!(Word::from_be_slice(&result.output), Word::from(12));
-    assert_eq!(backing.reads(), reads, "served from the borrowed overlay");
+    let (output, cheats) = executor.call();
+    assert_eq!(Word::from_be_slice(&output), Word::from(12));
+    assert!(Arc::ptr_eq(&cheats.registry, &executor.registry), "the registry was copied");
+    assert!(cheats.shared_overlay.is_some(), "the overlay was copied");
+    assert_eq!(backing.reads(), reads, "served from the shared overlay");
+    assert_eq!(counter(&executor, 0), 11);
+}
 
-    // First mutation: materialize the borrowed overlay, after which the state no longer needs it.
-    let fills = mem::replace(&mut evm.overlay_db_mut().cache, accepted.clone());
-    evm.overlay_db_mut().cache.merge(fills);
-    evm.overlay_db_mut().db = Box::new(backing.clone());
-    let detached = SavedState::save(mem::replace(evm.state_mut(), State::new(EmptyDB::default())));
-    drop(evm);
-    assert_eq!(detached.storage(backing, COUNTER, Word::ZERO), Word::from(11));
+/// The first mutation of an [`Executor::call`] comes from a cheatcode mid-transaction. It copies
+/// the registry and the accepted overlay before anything saves the live state: a snapshot or a
+/// saved fork keeps only the overlay cache, and reloads it over the backing database. The call
+/// then switches forks and restores a snapshot on its copies, and the discard leaves the executor
+/// as it was. Without the overlay copy, the script ends at 11, as if setUp's write never happened.
+#[test]
+fn speculative_call_copies_shared_state_at_first_mutation() {
+    let script: &[(Address, &[u8])] =
+        &[(CHEATS, &[SNAPSHOT]), select(1), INC, select(0), INC, (CHEATS, &[REVERT_TO, 0]), INC];
+    for isolate in [false, true] {
+        let mut executor = executor_with(&[]);
+        executor.isolate = isolate;
+        executor.run(&[INC], Mode::Commit);
+        // Control: the same script, committed by a call that owns the state.
+        let mut control = executor.clone();
+        control.run(script, Mode::Commit);
+        assert_eq!((counter(&control, 0), counter(&control, 1)), (12, 21), "isolate: {isolate}");
+
+        executor.set_code(TEST, returning_script_code(script));
+        let (output, cheats) = executor.call();
+        assert_eq!(Word::from_be_slice(&output), Word::from(12), "isolate: {isolate}");
+        assert!(!Arc::ptr_eq(&cheats.registry, &executor.registry), "isolate: {isolate}");
+        assert_eq!(cheats.registry.snapshots.len(), 1, "isolate: {isolate}");
+        drop(cheats);
+        assert_eq!(executor.registry.active, 0, "isolate: {isolate}");
+        assert!(executor.registry.snapshots.is_empty(), "isolate: {isolate}");
+        assert_eq!((counter(&executor, 0), counter(&executor, 1)), (11, 20), "isolate: {isolate}");
+    }
+}
+
+/// The first mutation can also come from an isolated child, which holds the moved overlay while
+/// it runs. The copy goes back to the parent with the overlay.
+#[test]
+fn speculative_call_copies_shared_state_in_isolated_child() {
+    let script: &[(Address, &[u8])] = &[(HANDLER, &[]), INC];
+    let mut executor = executor_with(&[(
+        HANDLER,
+        script_code(&[(CHEATS, &[SNAPSHOT]), select(1), INC, select(0)]),
+    )]);
+    executor.isolate = true;
+    executor.run(&[INC], Mode::Commit);
+    let mut control = executor.clone();
+    control.run(script, Mode::Commit);
+    assert_eq!((counter(&control, 0), counter(&control, 1)), (12, 21));
+
+    executor.set_code(TEST, returning_script_code(script));
+    let (output, cheats) = executor.call();
+    assert_eq!(Word::from_be_slice(&output), Word::from(12));
+    assert!(!Arc::ptr_eq(&cheats.registry, &executor.registry));
+    drop(cheats);
+    assert_eq!((counter(&executor, 0), counter(&executor, 1)), (11, 20));
 }
 
 #[test]
