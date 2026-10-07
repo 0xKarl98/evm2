@@ -143,12 +143,16 @@ impl SavedState {
         state
     }
 
-    /// Resets per-transaction substate at a transaction boundary, keeping pending writes.
-    fn reset_transaction_substate(self) -> Self {
+    /// Accepts the transaction layer into the overlay at the end of a committed transaction, then
+    /// clears per-transaction substate.
+    ///
+    /// The writes can't stay pending in the transaction layer: the next transaction needs each
+    /// original reset to its start value, and a commit only accepts entries that differ from their
+    /// original, so a write that isn't repeated after the fork is reselected would be lost.
+    fn accept_transaction(self) -> Self {
         let mut state = self.load(EmptyDB::default());
-        let pending = state.prepare_isolated_state();
+        state.commit_transaction();
         state.clear_transaction_state();
-        state.set_pending_state(pending);
         Self::save(state)
     }
 
@@ -463,8 +467,9 @@ impl Executor {
             return;
         }
         if mode == Mode::Commit {
+            // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
             for fork in &mut registry.forks {
-                fork.saved = fork.saved.take().map(SavedState::reset_transaction_substate);
+                fork.saved = fork.saved.take().map(SavedState::accept_transaction);
             }
         }
         self.active = Some(SavedState::save(state));
@@ -616,27 +621,50 @@ fn save_and_reload_fork_with_pending_writes_across_transactions() {
     let a = BackingDb::with_counter(10);
     let mut executor = Executor::new(vec![a.clone(), BackingDb::with_counter(20)]);
 
-    // Write on A, switch to B mid-transaction, write on B, commit (only B, the active fork).
+    // Write on A, switch to B mid-transaction, write on B, commit while B is active.
     executor.run(&[INC, select(1), INC], Mode::Commit);
     assert_eq!(executor.registry.active, 1);
     assert_eq!(executor.accepted(1, COUNTER, Word::ZERO), Some(Word::from(21)));
-    // A's write is pending in its saved transaction layer, not in its accepted overlay.
-    assert_eq!(executor.accepted(0, COUNTER, Word::ZERO), Some(Word::from(10)));
+    // The commit also accepts A's write into A's own overlay, though A is inactive.
+    assert_eq!(executor.accepted(0, COUNTER, Word::ZERO), Some(Word::from(11)));
     assert_eq!(counter(&executor, 0), 11);
-    // Its per-transaction substate was reset at the boundary.
+    // Its per-transaction substate was cleared at the boundary.
     let saved = executor.registry.forks[0].saved.clone().unwrap().load(EmptyDB::default());
     assert!(saved.journal().is_empty());
 
-    // A later transaction reloads A with its pending write and leaves it inactive again.
+    // A later transaction reloads A with its accepted write and leaves it inactive again.
     let reads = a.reads();
     executor.run(&[select(0), INC, select(1), INC], Mode::Commit);
     assert_eq!((counter(&executor, 0), counter(&executor, 1)), (12, 22));
     assert_eq!(a.reads(), reads, "reloading A must reuse its moved cache");
 
-    // Committing while A is active folds its pending writes into its overlay.
+    // Committing while A is active accepts its write as usual.
     executor.run(&[select(0), INC], Mode::Commit);
     assert_eq!(executor.accepted(0, COUNTER, Word::ZERO), Some(Word::from(13)));
     assert_eq!((counter(&executor, 0), counter(&executor, 1)), (13, 22));
+}
+
+/// Writes on a fork that is inactive at commit must not depend on being repeated once it is
+/// reselected, as they would if they stayed pending in its transaction layer.
+#[test]
+fn reselected_fork_keeps_writes_it_does_not_repeat() {
+    let counters = |executor: &Executor| {
+        (counter(executor, 0), executor.storage(0, COLD_COUNTER, Word::ZERO).to::<u64>())
+    };
+    let mut executor =
+        Executor::new(vec![BackingDb::with_counter(10), BackingDb::with_counter(20)]);
+    // Write two slots on A, then commit while B is active.
+    executor.run(&[INC, (COLD_COUNTER, &[]), select(1)], Mode::Commit);
+
+    // Committing on A without writing keeps both.
+    let mut reselected = executor.clone();
+    reselected.run(&[select(0)], Mode::Commit);
+    assert_eq!(reselected.registry.active, 0);
+    assert_eq!(counters(&reselected), (11, 11));
+
+    // Rewriting one keeps the other.
+    executor.run(&[select(0), INC], Mode::Commit);
+    assert_eq!(counters(&executor), (12, 11));
 }
 
 #[test]
