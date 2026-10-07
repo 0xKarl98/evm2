@@ -53,6 +53,8 @@ const CHEATS: Address = Address::with_last_byte(0xcc);
 const HANDLER: Address = Address::with_last_byte(0x4a);
 const NESTED: Address = Address::with_last_byte(0x4b);
 const FAILING: Address = Address::with_last_byte(0x4c);
+/// Emits its calldata as a log, like an event or a `console.log` in a test.
+const LOGGER: Address = Address::with_last_byte(0x10);
 
 /// `selectFork(arg)`.
 const SELECT_FORK: u8 = 1;
@@ -445,8 +447,7 @@ impl Cheats {
         self.record_root_start(fork);
         let incoming =
             self.registry_mut().forks[fork].saved.take().expect("inactive fork is saved");
-        let mut outgoing =
-            mem::replace(evm.state_mut(), incoming.load(self.registry.backing(fork)));
+        let mut outgoing = replace_state(evm, incoming.load(self.registry.backing(fork)));
         self.rebase_captured(self.registry.active, &mut outgoing);
         for address in &self.registry.persistent {
             merge_accepted_account(
@@ -475,7 +476,7 @@ impl Cheats {
             self.record_root_start(active);
         }
         let restored = active_state.into_state(self.registry.backing(active));
-        let mut left = mem::replace(evm.state_mut(), restored);
+        let mut left = replace_state(evm, restored);
         let left_selected = mem::replace(&mut self.selected, selected);
         let registry = self.registry_mut();
         let left_fork = mem::replace(&mut registry.active, active);
@@ -532,6 +533,8 @@ impl Cheats {
         match result {
             Ok(out) => {
                 self.child_gas.push(out.result.total_gas_spent);
+                // The child's logs follow the parent's, as if the call weren't isolated.
+                evm.state_mut().logs_mut().extend(out.result.logs);
                 let success = out.result.status;
                 if self.registry.active != source_fork || (success && restored) {
                     // The child's state replaces the parent's after a fork switch, as in master.
@@ -744,6 +747,17 @@ fn rebase_isolated_originals(state: &mut State<'_>, base: &State<'_>) {
         state.merge_transaction_account_from(address, base);
     }
     state.merge_isolated_state(captured.prepare_isolated_state());
+}
+
+/// Replaces the live state of `evm` with `state`, which keeps the transaction's logs.
+///
+/// Logs belong to the transaction, not to a fork or a snapshot: master keeps one journal across
+/// fork switches, and a snapshot restore takes the current logs (`BackendStateSnapshot::merge`).
+/// A loaded fork or a restored snapshot would bring back the logs it was captured with instead.
+/// The returned state has none.
+fn replace_state<'a>(evm: &mut Evm<'a, BaseEvmTypes>, mut state: State<'a>) -> State<'a> {
+    *state.logs_mut() = mem::take(evm.state_mut().logs_mut());
+    mem::replace(evm.state_mut(), state)
 }
 
 /// The accepted-state changes that committing `state`'s transaction layer would make.
@@ -995,6 +1009,20 @@ fn counter_code() -> Bytecode {
     ]))
 }
 
+/// Code that emits its calldata as a `LOG0`.
+fn logger_code() -> Bytecode {
+    Bytecode::new_legacy(Bytes::from_static(&[
+        op::CALLDATASIZE,
+        op::PUSH0,
+        op::PUSH0,
+        op::CALLDATACOPY,
+        op::CALLDATASIZE,
+        op::PUSH0,
+        op::LOG0,
+        op::STOP,
+    ]))
+}
+
 /// Code that performs `calls` in order and ignores their results.
 fn script_code(calls: &[(Address, &[u8])]) -> Bytecode {
     script_code_ending(calls, &[op::STOP])
@@ -1094,6 +1122,28 @@ const fn select(fork: u8) -> (Address, &'static [u8]) {
         0 => (CHEATS, &[SELECT_FORK, 0]),
         _ => (CHEATS, &[SELECT_FORK, 1]),
     }
+}
+
+/// A call to [`LOGGER`] that emits a log with data `[n]`.
+fn emit(n: u8) -> (Address, &'static [u8]) {
+    let data: &'static [u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    (LOGGER, &data[usize::from(n)..][..1])
+}
+
+/// The data of the logs that a committed call of `code` returns, run plainly or isolated.
+fn logs_after(executor: &mut Executor, code: Bytecode, isolate: bool) -> Vec<u8> {
+    executor.isolate = isolate;
+    let result = executor.run_code(code, Mode::Commit);
+    result.logs.iter().map(|log| log.data.data[0]).collect()
+}
+
+/// An executor with `contracts` on the first fork and [`LOGGER`] persistent, like the test
+/// contract that emits a test's events.
+fn logging_executor(contracts: &[(Address, Bytecode)]) -> Executor {
+    let mut executor = executor_with(contracts);
+    executor.set_code(LOGGER, logger_code());
+    Arc::make_mut(&mut executor.registry).persistent.insert(LOGGER);
+    executor
 }
 
 #[test]
@@ -1912,4 +1962,93 @@ fn speculative_call_after_registry_op_switches_forks() {
         assert_eq!(executor.registry.active, 0);
         assert_eq!((counter(executor, 0), counter(executor, 1)), (11, 20));
     }
+}
+
+/// Logs belong to the transaction, not to a fork: master keeps one journal across fork switches.
+/// Each fork's saved state carries the logs it was saved with, so loading it must not bring them
+/// back or drop the ones emitted since, also when an isolated child switches. The next
+/// transaction starts without logs.
+#[test]
+fn logs_survive_fork_switches() {
+    let script = [emit(1), select(1), emit(2), select(0), emit(3), select(1)];
+    for isolate in [false, true] {
+        let mut executor = logging_executor(&[]);
+        let logs = logs_after(&mut executor, script_code(&script), isolate);
+        assert_eq!(logs, [1, 2, 3], "isolate: {isolate}");
+        let logs = logs_after(&mut executor, script_code(&[select(0), emit(4)]), isolate);
+        assert_eq!(logs, [4], "isolate: {isolate}");
+
+        // The switch happens inside the handler, which runs in a child with isolation.
+        let mut executor =
+            logging_executor(&[(HANDLER, script_code(&[emit(2), select(1), emit(3)]))]);
+        let script = [emit(1), (HANDLER, &[][..]), emit(4), select(0), emit(5)];
+        let logs = logs_after(&mut executor, script_code(&script), isolate);
+        assert_eq!(logs, [1, 2, 3, 4, 5], "isolate: {isolate}");
+    }
+}
+
+/// A snapshot restore keeps the logs emitted since the snapshot, as master's
+/// `BackendStateSnapshot::merge` does, whether or not the restore leaves the active fork.
+#[test]
+fn logs_survive_snapshot_restores() {
+    let scripts: [&[(Address, &[u8])]; 2] = [
+        &[emit(1), (CHEATS, &[SNAPSHOT]), emit(2), (CHEATS, &[REVERT_TO, 0]), emit(3)],
+        &[emit(1), (CHEATS, &[SNAPSHOT]), select(1), emit(2), (CHEATS, &[REVERT_TO, 0]), emit(3)],
+    ];
+    for (i, script) in scripts.into_iter().enumerate() {
+        for isolate in [false, true] {
+            let mut executor = logging_executor(&[]);
+            let logs = logs_after(&mut executor, script_code(script), isolate);
+            assert_eq!(logs, [1, 2, 3], "script {i}, isolate: {isolate}");
+        }
+    }
+}
+
+/// An isolated child's logs come back with its result, as master's log collector sees them. A
+/// restore inside the child keeps the child's logs and doesn't bring back the parent's, whichever
+/// side took the snapshot.
+#[test]
+fn logs_survive_restores_in_isolated_children() {
+    let cases = [
+        (
+            &[(CHEATS, &[SNAPSHOT][..]), emit(2), (CHEATS, &[REVERT_TO, 0]), emit(3)][..],
+            &[emit(1), (HANDLER, &[][..]), emit(4)][..],
+        ),
+        (
+            &[emit(2), (CHEATS, &[REVERT_TO, 0]), emit(3)],
+            &[emit(1), (CHEATS, &[SNAPSHOT]), (HANDLER, &[]), emit(4)],
+        ),
+    ];
+    for (i, (handler, script)) in cases.into_iter().enumerate() {
+        for isolate in [false, true] {
+            let mut executor = logging_executor(&[(HANDLER, script_code(handler))]);
+            let logs = logs_after(&mut executor, script_code(script), isolate);
+            assert_eq!(logs, [1, 2, 3, 4], "case {i}, isolate: {isolate}");
+        }
+    }
+}
+
+/// A reverted call drops its own logs and nothing else, also when it restored a snapshot inside an
+/// isolated child and the restore is undone. A failed root drops them all.
+#[test]
+fn reverted_calls_drop_only_their_logs() {
+    for isolate in [false, true] {
+        let mut executor = logging_executor(&[
+            (FAILING, reverting_script_code(&[emit(2)])),
+            (HANDLER, script_code(&[emit(3), (FAILING, &[]), emit(4)])),
+        ]);
+        let script = [emit(1), (FAILING, &[][..]), (HANDLER, &[]), emit(5)];
+        let logs = logs_after(&mut executor, script_code(&script), isolate);
+        assert_eq!(logs, [1, 3, 4, 5], "isolate: {isolate}");
+
+        let code = reverting_script_code(&[emit(1), select(1), emit(2)]);
+        assert!(logs_after(&mut executor, code, isolate).is_empty(), "isolate: {isolate}");
+    }
+
+    let mut executor = logging_executor(&[
+        (FAILING, reverting_script_code(&[emit(3), (CHEATS, &[REVERT_TO, 0]), emit(4)])),
+        (HANDLER, script_code(&[emit(2), (FAILING, &[]), emit(5)])),
+    ]);
+    let script = [emit(1), (CHEATS, &[SNAPSHOT][..]), (HANDLER, &[]), emit(6)];
+    assert_eq!(logs_after(&mut executor, script_code(&script), true), [1, 2, 5, 6]);
 }
