@@ -709,12 +709,14 @@ enum Rebase {
 /// state a snapshot restore replaced. Accounts the parent wrote also keep the parent's warmth
 /// instead of the child's.
 fn rebase_isolated_originals(state: &mut State<'_>, base: &State<'_>) {
-    let captured = state.clone();
+    let captured = state.prepare_isolated_state();
     let writes = transaction_writes(base);
-    for address in writes.accounts.keys().chain(writes.storage.keys()) {
+    let storage_only =
+        writes.storage.keys().filter(|address| !writes.accounts.contains_key(*address));
+    for address in writes.accounts.keys().chain(storage_only) {
         state.merge_transaction_account_from(address, base);
     }
-    state.merge_isolated_state(captured.prepare_isolated_state());
+    state.merge_isolated_state(captured);
 }
 
 /// Replaces the live state of `evm` with `state`, which keeps the transaction's logs.
