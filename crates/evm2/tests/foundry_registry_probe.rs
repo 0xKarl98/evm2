@@ -11,7 +11,7 @@
 
 use alloy_consensus::{TxLegacy, transaction::Recovered};
 use alloy_primitives::{
-    Address, B256, Bytes, TxKind,
+    Address, B256, Bytes, TxKind, U256,
     map::{AddressMap, AddressSet, B256Map, HashMap},
 };
 use evm2::{
@@ -19,7 +19,7 @@ use evm2::{
     Version,
     bytecode::Bytecode,
     env::BlockEnvExt,
-    ethereum::{TxEnvelope, ethereum_tx_registry},
+    ethereum::{TxEnvelope, ethereum_tx_registry, intrinsic_gas},
     evm::{
         AccountInfo, Cache, DbResult, DynDatabase, EmptyDB, PendingState, State, StateCheckpoint,
         StateSnapshot, TxResult,
@@ -483,11 +483,22 @@ impl Cheats {
         let source_fork = self.registry.active;
         let cheats = Rc::new(RefCell::new(Self { in_child: true, ..mem::take(self) }));
         let result = run_child_with(evm, |parent, child| {
+            // The child's intrinsic gas comes on top of the frame's gas, as in `transact_inner`.
+            let to = TxKind::Call(message.destination);
+            let intrinsic = intrinsic_gas(
+                parent.version(),
+                message.caller,
+                to,
+                &message.input,
+                0,
+                0,
+                U256::ZERO,
+            );
             let tx = legacy_tx(
                 message.caller,
                 message.destination,
                 message.input.clone(),
-                message.gas_limit,
+                message.gas_limit + intrinsic,
             );
             cheats.borrow_mut().child_base =
                 Some((source_fork, parent.state().clone_with(EmptyDB::default())));
@@ -512,7 +523,15 @@ impl Cheats {
                 } else {
                     evm.state_mut().merge_isolated_state(out.pending_state);
                 }
-                message_result(message, success, out.result.output)
+                // The frame pays the child's gas, intrinsic included, and takes its refund, as in
+                // `transact_inner`. If that exceeds the frame's gas, the frame spends all of it.
+                // `SPEC` has no state gas or calldata floor.
+                let mut result = message_result(message, success, out.result.output);
+                if result.gas.spend(out.result.total_gas_spent).is_err() {
+                    result.gas.spend_all();
+                }
+                result.gas.set_refunded(out.result.refunded as i64);
+                result
             }
             Err(_) => message_result(message, false, Bytes::new()),
         }
@@ -1333,6 +1352,19 @@ fn isolated_child_shares_overlay_by_move() {
     // The second child starts from the first child's merged write.
     assert_eq!(counter(&executor, 0), 13);
     assert_eq!(backing.reads(), reads, "children read the moved overlay, not the backing");
+}
+
+/// The parent frame pays an isolated child's gas, as master's `transact_inner` charges the frame
+/// with the child's transaction. The child runs as its own transaction, so a call costs its
+/// intrinsic gas more than a plain one.
+#[test]
+fn isolated_call_charges_child_gas() {
+    let gas = [false, true].map(|isolate| {
+        let mut executor = executor_with(&[]);
+        executor.isolate = isolate;
+        executor.run_code(script_code(&[INC])).total_gas_spent
+    });
+    assert_eq!(gas[1] - gas[0], 21_000, "plain: {}, isolated: {}", gas[0], gas[1]);
 }
 
 /// Cheatcodes that a contract calls inside an isolated child reach the inspector. A fork the child
