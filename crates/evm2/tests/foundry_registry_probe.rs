@@ -244,15 +244,11 @@ struct Cheats {
     /// gets the parent's originals back. Otherwise the parent's writes before the child would be
     /// lost once a snapshot taken in the child is restored or the fork the child left is accepted.
     child_base: Option<(usize, State<'static>)>,
-    /// How state captured in an isolated child gets the parent's originals back.
-    rebase: Rebase,
     /// Snapshot restores in the running child that are still in effect, like master's
     /// `isolated_snapshot_restores`.
     child_restores: Vec<ChildRestore>,
     /// Calls running in the child, like master's `isolated_frame_checkpoints`.
     child_calls: Vec<ChildCall>,
-    /// Gas each isolated child spent.
-    child_gas: Vec<u64>,
     /// The state each fork the root frame touched had when the root started, without the overlay
     /// cache, starting with the start fork. Like master's `top_frame_journal`, but for every fork
     /// and in plain mode too. Other forks are recorded when the root first selects them.
@@ -269,10 +265,8 @@ impl Default for Cheats {
             isolate: false,
             in_child: false,
             child_base: None,
-            rebase: Rebase::Adapter,
             child_restores: Vec::new(),
             child_calls: Vec::new(),
-            child_gas: Vec::new(),
             root_start: Vec::new(),
         }
     }
@@ -511,7 +505,6 @@ impl Cheats {
         self.child_calls.clear();
         match result {
             Ok(out) => {
-                self.child_gas.push(out.result.total_gas_spent);
                 // The child's logs follow the parent's, as if the call weren't isolated.
                 evm.state_mut().logs_mut().extend(out.result.logs);
                 let success = out.result.status;
@@ -611,10 +604,8 @@ impl Cheats {
 
     /// Gives `state`, captured on `fork` in an isolated child, the parent's originals back.
     fn rebase_captured(&self, fork: usize, state: &mut State<'_>) {
-        let Some(base) = self.child_base(fork) else { return };
-        match self.rebase {
-            Rebase::Adapter => rebase_isolated_originals(state, base),
-            Rebase::Off => {}
+        if let Some(base) = self.child_base(fork) {
+            rebase_isolated_originals(state, base);
         }
     }
 
@@ -699,15 +690,6 @@ fn merge_accepted_account(target: &mut Cache, source: &Cache, address: &Address)
     target.merge(entry);
 }
 
-/// How [`Cheats`] rebases state captured in an isolated child onto the parent's originals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rebase {
-    /// [`rebase_isolated_originals`], except while a snapshot restore in the child is in effect.
-    Adapter,
-    /// Keeps the child's originals and metadata, as master does.
-    Off,
-}
-
 /// Gives every account and slot that `state`, captured in an isolated child, shares with `base`,
 /// the parent state the child was prepared from, its original in `base`, through public API.
 ///
@@ -755,8 +737,6 @@ struct Executor {
     /// The active fork's state while no call runs.
     active: Option<SavedState>,
     isolate: bool,
-    rebase: Rebase,
-    child_gas: Vec<u64>,
 }
 
 impl Executor {
@@ -768,13 +748,7 @@ impl Executor {
         let mut registry = Registry { forks, ..Default::default() };
         registry.persistent.extend([CALLER, TEST]);
         let active = registry.forks[0].saved.take();
-        Self {
-            registry: Arc::new(registry),
-            active,
-            isolate: false,
-            rebase: Rebase::Adapter,
-            child_gas: Vec::new(),
-        }
+        Self { registry: Arc::new(registry), active, isolate: false }
     }
 
     /// Writes outside a transaction go straight to the active overlay.
@@ -806,7 +780,6 @@ impl Executor {
             registry: mem::take(&mut self.registry),
             selected,
             isolate: self.isolate,
-            rebase: self.rebase,
             ..Default::default()
         });
         let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
@@ -819,7 +792,6 @@ impl Executor {
 
     fn finish(&mut self, cheats: Cheats, state: State<'_>) {
         let mut registry = cheats.registry;
-        self.child_gas.extend(cheats.child_gas);
         // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
         for fork in &mut Arc::make_mut(&mut registry).forks {
             fork.saved = fork.saved.take().map(SavedState::accept_transaction);
@@ -851,7 +823,6 @@ impl Executor {
             shared_overlay: Some(Arc::clone(&state.cache)),
             selected: state.rest.clone(),
             isolate: self.isolate,
-            rebase: self.rebase,
             ..Default::default()
         });
         let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
@@ -1016,26 +987,22 @@ fn executor_with(contracts: &[(Address, Bytecode)]) -> Executor {
     executor
 }
 
-/// Fork 0's counter after `script` runs plainly, or isolated with `rebase`.
+/// Fork 0's counter after `script` runs plainly or isolated.
 fn counter_after(
     contracts: &[(Address, Bytecode)],
     script: &[(Address, &[u8])],
-    rebase: Option<Rebase>,
+    isolate: bool,
 ) -> u64 {
     let mut executor = executor_with(contracts);
-    if let Some(rebase) = rebase {
-        executor.isolate = true;
-        executor.rebase = rebase;
-    }
+    executor.isolate = isolate;
     executor.run(script);
     counter(&executor, 0)
 }
 
-/// Runs `script` isolated with `rebase` and `handler` at [`HANDLER`], and returns the root's gas.
-fn run_isolated(handler: Bytecode, script: &[(Address, &[u8])], rebase: Rebase) -> (Executor, u64) {
+/// Runs `script` isolated with `handler` at [`HANDLER`], and returns the root's gas.
+fn run_isolated(handler: Bytecode, script: &[(Address, &[u8])]) -> (Executor, u64) {
     let mut executor = executor_with(&[(HANDLER, handler)]);
     executor.isolate = true;
-    executor.rebase = rebase;
     let result = executor.run_code(script_code(script));
     assert!(result.status, "test call failed: {result:?}");
     (executor, result.total_gas_spent)
@@ -1454,21 +1421,20 @@ fn isolated_child_restore_survives_reverted_sibling() {
 /// entries that differ from their original. Master keeps the writes because its commit takes the
 /// present value of every slot of a touched account. Here [`Cheats::child_base`] rebases the
 /// captured state onto the parent's originals with [`rebase_isolated_originals`]. Keeping the
-/// child's originals, as [`Rebase::Off`] does, loses them.
+/// child's originals loses them: both scripts would end at 10.
 #[test]
 fn state_captured_in_isolated_child_keeps_parent_writes() {
-    let rebases = [None, Some(Rebase::Adapter), Some(Rebase::Off)];
-
     // The parent restores a snapshot taken inside a child.
     let contracts = [(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))];
     let script = [INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 0])];
-    let restored = rebases.map(|rebase| counter_after(&contracts, &script, rebase));
-    assert_eq!(restored, [11, 11, 10], "plain, adapter, off");
+    let restored = [false, true].map(|isolate| counter_after(&contracts, &script, isolate));
+    assert_eq!(restored, [11, 11], "plain, isolated");
 
     // A child leaves the fork, which saves the child's state for it.
     let contracts = [(HANDLER, script_code(&[select(1)]))];
-    let left = rebases.map(|rebase| counter_after(&contracts, &[INC, (HANDLER, &[])], rebase));
-    assert_eq!(left, [11, 11, 10], "plain, adapter, off");
+    let left =
+        [false, true].map(|isolate| counter_after(&contracts, &[INC, (HANDLER, &[])], isolate));
+    assert_eq!(left, [11, 11], "plain, isolated");
 }
 
 /// A snapshot restore that leaves a fork keeps its overlay and drops its writes since it was
@@ -1487,9 +1453,8 @@ fn restore_leaving_fork_drops_parent_writes_captured_in_isolated_child() {
         (CHEATS, &[REVERT_TO, 1]),
         (CHEATS, &[REVERT_TO, 0]),
     ];
-    let results =
-        [None, Some(Rebase::Adapter)].map(|rebase| counter_after(&contracts, &script, rebase));
-    assert_eq!(results, [10, 10], "plain, adapter");
+    let results = [false, true].map(|isolate| counter_after(&contracts, &script, isolate));
+    assert_eq!(results, [10, 10], "plain, isolated");
 }
 
 /// [`rebase_isolated_originals`] re-adds the parent's entries that the captured state lacks. After
@@ -1502,9 +1467,8 @@ fn rebase_skipped_after_restore_in_isolated_child() {
     let contracts = [(HANDLER, script_code(&[(CHEATS, &[REVERT_TO, 0]), (CHEATS, &[SNAPSHOT])]))];
     let script: &[(Address, &[u8])] =
         &[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[]), (CHEATS, &[REVERT_TO, 1])];
-    let results =
-        [None, Some(Rebase::Adapter)].map(|rebase| counter_after(&contracts, script, rebase));
-    assert_eq!(results, [10, 10], "plain, adapter");
+    let results = [false, true].map(|isolate| counter_after(&contracts, script, isolate));
+    assert_eq!(results, [10, 10], "plain, isolated");
 
     let contracts = [
         (HANDLER, script_code(&[(FAILING, &[]), (CHEATS, &[SNAPSHOT])])),
@@ -1513,41 +1477,37 @@ fn rebase_skipped_after_restore_in_isolated_child() {
     // Only isolated calls undo restores, so the child's snapshot is taken at 11.
     let script: &[(Address, &[u8])] =
         &[(CHEATS, &[SNAPSHOT]), INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 1])];
-    assert_eq!(counter_after(&contracts, script, Some(Rebase::Adapter)), 11);
+    assert_eq!(counter_after(&contracts, script, true), 11);
 }
 
 /// Rebasing through public API changes metadata, and gas with it. [`rebase_isolated_originals`]
-/// gives an account the parent wrote the parent's warmth, where master keeps the child's, as
-/// [`Rebase::Off`] does. Restored in the parent, the snapshot leaves `COUNTER` warm, so calling it
-/// costs 2,500 gas less. Restored in the child, `INC` also reads a warm slot (2,000 less), and its
-/// write sees the parent's original rather than the child's (2,800 less), which any rebase of the
-/// originals, an evm2 one included, would change too.
+/// gives an account the parent wrote the parent's warmth, where master keeps the child's: cold,
+/// with the child's original 11. Restored in the parent, the snapshot leaves `COUNTER` warm, so
+/// calling it costs 2,500 gas less than on master (104,688). Restored in the child, `INC` also
+/// reads a warm slot (2,000 less), and its write sees the parent's original rather than the child's
+/// (2,800 less), which any rebase of the originals, an evm2 one included, would change too: 7,300
+/// less than master's 83,688 in all.
 #[test]
 fn rebased_capture_takes_parent_warmth() {
     let snapshot = || script_code(&[(CHEATS, &[SNAPSHOT])]);
-    let restore_in_child = || script_code(&[(CHEATS, &[SNAPSHOT]), (CHEATS, &[REVERT_TO, 0]), INC]);
-    let [off, adapter] = [Rebase::Off, Rebase::Adapter].map(|rebase| {
-        let (executor, _) = run_isolated(snapshot(), &[INC, (HANDLER, &[])], rebase);
-        let snapshot_state = executor.registry.snapshots[0].active_state.clone();
-        let mut state = snapshot_state.into_state(EmptyDB::default());
-        let account_warm = state.account(&COUNTER).unwrap().is_warm();
-        let warm = (account_warm, state.storage(&COUNTER).is_warm(&Word::ZERO));
-        let original = state.storage_slot(&COUNTER, Word::ZERO).unwrap().original();
-
-        let script = [INC, (HANDLER, &[]), (CHEATS, &[REVERT_TO, 0]), INC];
-        let (in_parent, root_gas) = run_isolated(snapshot(), &script, rebase);
-        let (in_child, _) = run_isolated(restore_in_child(), &[INC, (HANDLER, &[])], rebase);
-        assert_eq!([counter(&in_parent, 0), counter(&in_child, 0)], [12, 12]);
-        (warm, original.to::<u64>(), root_gas, in_child.child_gas[1])
-    });
-    assert_eq!((off.0, off.1), ((false, false), 11), "account and slot warmth, original");
-    assert_eq!((adapter.0, adapter.1), ((true, true), 10), "account and slot warmth, original");
-    assert_eq!(off.2 - adapter.2, 2_500, "root: warm call");
+    let (executor, _) = run_isolated(snapshot(), &[INC, (HANDLER, &[])]);
+    let snapshot_state = executor.registry.snapshots[0].active_state.clone();
+    let mut state = snapshot_state.into_state(EmptyDB::default());
+    let account_warm = state.account(&COUNTER).unwrap().is_warm();
+    let warm = (account_warm, state.storage(&COUNTER).is_warm(&Word::ZERO));
+    let original = state.storage_slot(&COUNTER, Word::ZERO).unwrap().original();
     assert_eq!(
-        off.3 - adapter.3,
-        2_500 + 2_000 + 2_800,
-        "child: warm call, warm read, dirty write"
+        (warm, original.to::<u64>()),
+        ((true, true), 10),
+        "account and slot warmth, original"
     );
+
+    let script = [INC, (HANDLER, &[]), (CHEATS, &[REVERT_TO, 0]), INC];
+    let (in_parent, in_parent_gas) = run_isolated(snapshot(), &script);
+    let restore_in_child = script_code(&[(CHEATS, &[SNAPSHOT]), (CHEATS, &[REVERT_TO, 0]), INC]);
+    let (in_child, in_child_gas) = run_isolated(restore_in_child, &[INC, (HANDLER, &[])]);
+    assert_eq!([counter(&in_parent, 0), counter(&in_child, 0)], [12, 12]);
+    assert_eq!([in_parent_gas, in_child_gas], [104_688 - 2_500, 83_688 - 7_300], "parent, child");
 }
 
 /// A failed root frame drops the isolated children's writes, also after a snapshot restore in the
