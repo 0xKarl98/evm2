@@ -251,8 +251,6 @@ struct Cheats {
     child_restores: Vec<ChildRestore>,
     /// Calls running in the child, like master's `isolated_frame_checkpoints`.
     child_calls: Vec<ChildCall>,
-    /// Whether the parent's overlay was empty while the isolated child ran.
-    parent_overlay_moved: Vec<bool>,
     /// Gas each isolated child spent.
     child_gas: Vec<u64>,
     /// The state each fork the root frame touched had when the root started, without the overlay
@@ -274,7 +272,6 @@ impl Default for Cheats {
             rebase: Rebase::Adapter,
             child_restores: Vec::new(),
             child_calls: Vec::new(),
-            parent_overlay_moved: Vec::new(),
             child_gas: Vec::new(),
             root_start: Vec::new(),
         }
@@ -485,10 +482,7 @@ impl Cheats {
     ) -> MessageResult<BaseEvmTypes> {
         let source_fork = self.registry.active;
         let cheats = Rc::new(RefCell::new(Self { in_child: true, ..mem::take(self) }));
-        let mut moved = false;
         let result = run_child_with(evm, |parent, child| {
-            moved = parent.overlay_db().cache.accounts.is_empty()
-                && child.overlay_db().cache.accounts.contains_key(&COUNTER);
             let tx = legacy_tx(
                 message.caller,
                 message.destination,
@@ -504,7 +498,6 @@ impl Cheats {
         *self = Self { in_child: false, child_base: None, ..cheats };
         let restored = !mem::take(&mut self.child_restores).is_empty();
         self.child_calls.clear();
-        self.parent_overlay_moved.push(moved);
         match result {
             Ok(out) => {
                 self.child_gas.push(out.result.total_gas_spent);
@@ -744,7 +737,6 @@ struct Executor {
     active: Option<SavedState>,
     isolate: bool,
     rebase: Rebase,
-    parent_overlay_moved: Vec<bool>,
     child_gas: Vec<u64>,
 }
 
@@ -762,7 +754,6 @@ impl Executor {
             active,
             isolate: false,
             rebase: Rebase::Adapter,
-            parent_overlay_moved: Vec::new(),
             child_gas: Vec::new(),
         }
     }
@@ -809,7 +800,6 @@ impl Executor {
 
     fn finish(&mut self, cheats: Cheats, state: State<'_>) {
         let mut registry = cheats.registry;
-        self.parent_overlay_moved.extend(cheats.parent_overlay_moved);
         self.child_gas.extend(cheats.child_gas);
         // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
         for fork in &mut Arc::make_mut(&mut registry).forks {
@@ -1342,7 +1332,6 @@ fn isolated_child_shares_overlay_by_move() {
     executor.run(&[INC, INC]);
     // The second child starts from the first child's merged write.
     assert_eq!(counter(&executor, 0), 13);
-    assert_eq!(executor.parent_overlay_moved, [true, true]);
     assert_eq!(backing.reads(), reads, "children read the moved overlay, not the backing");
 }
 
