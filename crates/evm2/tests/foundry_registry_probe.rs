@@ -1644,20 +1644,6 @@ fn measure_per_call_evm_construction_and_cache_move() {
             black_box(new_evm(EmptyDB::default()));
         })
     );
-    println!(
-        "  ExecutionConfig: {:?}",
-        time(ITERS, || {
-            black_box(execution_config());
-        })
-    );
-    println!(
-        "  ethereum_tx_registry: {:?}",
-        time(ITERS, || drop(black_box(ethereum_tx_registry::<BaseEvmTypes>(SPEC))))
-    );
-    println!(
-        "  Precompiles::base: {:?}",
-        time(ITERS, || drop(black_box(Precompiles::<BaseEvmTypes>::base(SPEC))))
-    );
 
     for accounts in [0usize, 1_000, 100_000] {
         let mut state = State::new(EmptyDB::default());
@@ -1701,15 +1687,10 @@ fn measure_per_call_evm_construction_and_cache_move() {
             ..Default::default()
         };
         let registry_cloned = time(ITERS, || drop(black_box(Registry::clone(&registry))));
-        let snapshots_cloned = time(ITERS.min(20), || {
-            let snapshots =
-                registry.snapshots.iter().map(|snapshot| RegistrySnapshot::clone(snapshot));
-            drop(black_box(snapshots.collect::<Vec<_>>()))
-        });
         println!(
             "cache of {accounts} accounts + slots: Evm::new + move in/out {moved:?}; \
              with a counter tx {call:?}; StateSnapshot clone {cloned:?}; Registry clone with \
-             {SNAPSHOTS} snapshots {registry_cloned:?}, copying the snapshots {snapshots_cloned:?}"
+             {SNAPSHOTS} snapshots {registry_cloned:?}"
         );
     }
 }
