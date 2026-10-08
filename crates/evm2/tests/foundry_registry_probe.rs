@@ -227,8 +227,6 @@ struct Cheats {
     /// The active fork's accepted overlay while an [`Executor::call`] shares it. The [`Evm`]
     /// reads it through [`AcceptedView`], so the live overlay cache holds only this call's reads.
     shared_overlay: Option<Arc<Cache>>,
-    /// The fork active when the call started.
-    start_fork: usize,
     /// The active fork's transaction layer, journal, and logs as it was selected, or as the call
     /// started. Foundry stores this with the fork as its `journaled_state`. A snapshot restore
     /// that leaves the fork puts it back, so only the fork's writes since are dropped.
@@ -269,7 +267,6 @@ impl Default for Cheats {
         Self {
             registry: Arc::default(),
             shared_overlay: None,
-            start_fork: 0,
             selected: SavedState::default().rest,
             isolate: false,
             in_child: false,
@@ -573,8 +570,8 @@ impl Cheats {
     fn restore_root(&mut self, evm: &mut Evm<'_, BaseEvmTypes>) {
         let root_start = mem::take(&mut self.root_start);
         let active = self.registry.active;
-        let start = (active != self.start_fork)
-            .then(|| root_start[0].1.clone().into_state(EmptyDB::default()));
+        let (start_fork, start) = &root_start[0];
+        let start = (active != *start_fork).then(|| start.clone().into_state(EmptyDB::default()));
         for (fork, rest) in root_start {
             if fork == active {
                 let mut state = rest.into_state(EmptyDB::default());
@@ -797,7 +794,6 @@ impl Executor {
         *evm.state_mut() = state.load(self.registry.backing(active));
         evm.set_inspector(Cheats {
             registry: mem::take(&mut self.registry),
-            start_fork: active,
             selected,
             isolate: self.isolate,
             rebase: self.rebase,
@@ -844,7 +840,6 @@ impl Executor {
         evm.set_inspector(Cheats {
             registry: Arc::clone(&self.registry),
             shared_overlay: Some(Arc::clone(&state.cache)),
-            start_fork: active,
             selected: state.rest.clone(),
             isolate: self.isolate,
             rebase: self.rebase,
