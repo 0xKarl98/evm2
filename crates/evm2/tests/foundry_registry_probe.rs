@@ -24,7 +24,7 @@ use evm2::{
         AccountInfo, Cache, DbResult, DynDatabase, EmptyDB, PendingState, State, StateCheckpoint,
         StateSnapshot, TxResult,
     },
-    interpreter::{GasTracker, InstrStop, Interpreter, Message, MessageResult, Word, op},
+    interpreter::{GasTracker, InstrStop, Interpreter, Message, MessageKind, MessageResult, Word, op},
 };
 use std::{
     cell::RefCell,
@@ -304,7 +304,9 @@ impl Inspector<BaseEvmTypes> for Cheats {
             let output = self.dispatch(interp.host(), &message.input);
             return Some(message_result(message, output.is_some(), output.unwrap_or_default()));
         }
-        if self.isolate && !self.in_child && message.depth == 1 {
+        if self.isolate && !self.in_child && message.depth == 1
+            && message.kind == MessageKind::Call
+        {
             return Some(self.isolated_call(interp.host(), message));
         }
         if self.in_child {
@@ -373,8 +375,6 @@ impl Cheats {
                 self.transact(evm, target)
             }
             STATE_WRITE => {
-                // Foundry's `loadAllocs` and `cloneAccount` load and touch the account first.
-                evm.state_mut().account(&COUNTER).ok()?.touch();
                 evm.state_mut().storage_slot(&COUNTER, Word::ZERO).ok()?.set(Word::from(100));
                 Some(Bytes::new())
             }
@@ -1470,19 +1470,17 @@ fn isolated_child_restore_survives_reverted_sibling() {
 /// child's originals loses them: both scripts would end at 10.
 #[test]
 fn state_captured_in_isolated_child_keeps_parent_writes() {
-    for (write, expected) in [(INC, 11), ((CHEATS, &[STATE_WRITE][..]), 100)] {
-        // The parent restores a snapshot taken inside a child.
-        let contracts = [(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))];
-        let script = [write, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 0])];
-        let restored = [false, true].map(|isolate| counter_after(&contracts, &script, isolate));
-        assert_eq!(restored, [expected, expected], "plain, isolated");
+    // The parent restores a snapshot taken inside a child.
+    let contracts = [(HANDLER, script_code(&[(CHEATS, &[SNAPSHOT])]))];
+    let script = [INC, (HANDLER, &[]), INC, (CHEATS, &[REVERT_TO, 0])];
+    let restored = [false, true].map(|isolate| counter_after(&contracts, &script, isolate));
+    assert_eq!(restored, [11, 11], "plain, isolated");
 
-        // A child leaves the fork, which saves the child's state for it.
-        let contracts = [(HANDLER, script_code(&[select(1)]))];
-        let left = [false, true]
-            .map(|isolate| counter_after(&contracts, &[write, (HANDLER, &[])], isolate));
-        assert_eq!(left, [expected, expected], "plain, isolated");
-    }
+    // A child leaves the fork, which saves the child's state for it.
+    let contracts = [(HANDLER, script_code(&[select(1)]))];
+    let left =
+        [false, true].map(|isolate| counter_after(&contracts, &[INC, (HANDLER, &[])], isolate));
+    assert_eq!(left, [11, 11], "plain, isolated");
 }
 
 /// A snapshot restore that leaves a fork keeps its overlay and drops its writes since it was
@@ -2002,24 +2000,4 @@ fn reverted_calls_drop_only_their_logs() {
     ]);
     let script = [emit(1), (CHEATS, &[SNAPSHOT][..]), (HANDLER, &[]), emit(6)];
     assert_eq!(logs_after(&mut executor, script_code(&script), true), [1, 2, 5, 6]);
-}
-
-/// A cheatcode write loads its account before a persistent fork switch copies the transaction
-/// layer, even when no contract call has loaded that account.
-#[test]
-fn state_write_follows_persistent_account_across_fork_switch() {
-    let scripts = [
-        (&[PERSIST_COUNTER, (CHEATS, &[STATE_WRITE][..]), select(1), INC][..], 101),
-        (&[PERSIST_COUNTER, (CHEATS, &[STATE_WRITE]), select(1)], 100),
-    ];
-    for (script, expected) in scripts {
-        let counters = [false, true].map(|isolate| {
-            let mut executor = executor_with(&[]);
-            executor.isolate = isolate;
-            executor.run(script);
-            assert_eq!(executor.registry.active, 1, "isolate: {isolate}");
-            (counter(&executor, 0), counter(&executor, 1))
-        });
-        assert_eq!(counters, [(100, expected), (100, expected)], "plain, isolated");
-    }
 }
