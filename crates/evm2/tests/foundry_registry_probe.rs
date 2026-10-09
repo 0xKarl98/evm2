@@ -403,9 +403,10 @@ impl Cheats {
 
     /// Saves the active fork and loads `fork` into the running `Evm`.
     ///
-    /// Persistent accounts follow the switch with both layers, as in Foundry's
-    /// `merge_account_data`: the accepted overlay entry, then the transaction layer. Like the
-    /// fork's `journaled_state` in Foundry, [`Self::selected`] is recorded after the merge.
+    /// Persistent accounts follow the switch as in Foundry's `select_fork`: slots the incoming
+    /// fork's transaction already loaded are refreshed, then `merge_account_data` brings the
+    /// accepted overlay entry and the transaction layer. Like the fork's `journaled_state` in
+    /// Foundry, [`Self::selected`] is recorded after the merge.
     fn select_fork(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, fork: usize) {
         if self.registry.active == fork {
             return;
@@ -416,6 +417,7 @@ impl Cheats {
         let mut outgoing = replace_state(evm, incoming.load(self.registry.backing(fork)));
         self.rebase_captured(self.registry.active, &mut outgoing);
         for address in &self.registry.persistent {
+            refresh_loaded_slots(evm.state_mut(), &outgoing.overlay_db().cache, address);
             merge_accepted_account(
                 &mut evm.overlay_db_mut().cache,
                 &outgoing.overlay_db().cache,
@@ -688,6 +690,25 @@ fn merge_accepted_account(target: &mut Cache, source: &Cache, address: &Address)
         entry.storage.insert(*address, storage.clone());
     }
     target.merge(entry);
+}
+
+/// Gives each slot of `address` that `target`'s transaction has loaded its accepted value in
+/// `source`, if cached, as Foundry's `select_fork` refreshes the target fork's journaled state
+/// (foundry-rs/foundry#10296, #10552).
+///
+/// The transaction layer shadows the accepted overlay, so merging the accepted entry alone leaves
+/// such a slot with the incoming fork's value. Like Foundry, this replaces only the current value:
+/// the slot keeps its original and warmth, and nothing is journaled. `storage_slot` doesn't load
+/// the account, and `merge_isolated_state` keeps the originals of loaded slots.
+fn refresh_loaded_slots(target: &mut State<'_>, source: &Cache, address: &Address) {
+    let Some(storage) = source.storage.get(address) else { return };
+    let mut refreshed = State::new(EmptyDB::default());
+    for (key, value) in &storage.slots {
+        if target.get_storage(address, key).is_some() {
+            refreshed.storage_slot(address, *key).unwrap().set(*value);
+        }
+    }
+    target.merge_isolated_state(refreshed.prepare_isolated_state());
 }
 
 /// Gives every account and slot that `state`, captured in an isolated child, shares with `base`,
@@ -1154,6 +1175,29 @@ fn persistent_account_unchanged_by_transaction_survives_commit() {
     assert_eq!(deployed(&executor), 2);
     executor.run(&[(DEPLOYED, &[])]);
     assert_eq!(deployed(&executor), 3);
+}
+
+/// A slot of a persistent account that the incoming fork's transaction already loaded takes the
+/// outgoing fork's accepted value, as Foundry refreshes it. The forked counters are 11 on A and
+/// 21 on B when the counter is made persistent on A; Foundry gives 12 on B after an increment and
+/// 11 without one, in plain and isolated mode alike.
+#[test]
+fn persistent_account_refreshes_slot_loaded_on_incoming_fork() {
+    let scripts = [
+        (&[select(1), INC, select(0), PERSIST_COUNTER, select(1), INC][..], 12),
+        (&[select(1), INC, select(0), PERSIST_COUNTER, select(1)], 11),
+    ];
+    for (script, expected) in scripts {
+        for isolate in [false, true] {
+            let mut executor = executor_with(&[]);
+            executor.run(&[INC]);
+            executor.isolate = isolate;
+            executor.run(script);
+            assert_eq!(executor.registry.active, 1, "isolate: {isolate}");
+            assert_eq!(counter(&executor, 1), expected, "isolate: {isolate}");
+            assert_eq!(counter(&executor, 0), 11, "isolate: {isolate}");
+        }
+    }
 }
 
 /// Like Foundry's `revert_state`, a snapshot restore also reverts persistent accounts.
