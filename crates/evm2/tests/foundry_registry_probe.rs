@@ -464,7 +464,7 @@ impl Cheats {
     /// the live transaction layer from the child's pending state, without journaling and without
     /// further reads.
     fn transact(&mut self, evm: &mut Evm<'_, BaseEvmTypes>, target: Address) -> Option<Bytes> {
-        let (output, pending) = run_child(evm, CALLER, target, Bytes::new(), 1_000_000).ok()?;
+        let (output, pending) = run_child(evm, CALLER, target, Bytes::new(), 1_000_000, U256::ZERO).ok()?;
         evm.overlay_db_mut().commit_pending(&pending);
         evm.state_mut().merge_isolated_state(pending);
         Some(output)
@@ -497,6 +497,7 @@ impl Cheats {
                 message.destination,
                 message.input.clone(),
                 message.gas_limit + intrinsic,
+                message.value,
             );
             cheats.borrow_mut().child_base =
                 Some((source_fork, parent.state().clone_with(EmptyDB::default())));
@@ -664,9 +665,10 @@ fn run_child(
     to: Address,
     input: Bytes,
     gas_limit: u64,
+    value: U256,
 ) -> Result<(Bytes, PendingState), ()> {
     run_child_with(parent, |_, child| {
-        let out = child.transact(&legacy_tx(caller, to, input, gas_limit)).map_err(drop)?.detach();
+        let out = child.transact(&legacy_tx(caller, to, input, gas_limit, value)).map_err(drop)?.detach();
         if out.result.status { Ok((out.result.output, out.pending_state)) } else { Err(()) }
     })
 }
@@ -805,7 +807,7 @@ impl Executor {
             isolate: self.isolate,
             ..Default::default()
         });
-        let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
+        let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000, U256::ZERO)).unwrap();
         let result = executed.commit();
         let cheats = *evm.clear_inspector_as::<Cheats>().unwrap();
         let state = mem::replace(evm.state_mut(), State::new(EmptyDB::default()));
@@ -848,7 +850,7 @@ impl Executor {
             isolate: self.isolate,
             ..Default::default()
         });
-        let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000)).unwrap();
+        let executed = evm.transact(&legacy_tx(CALLER, TEST, Bytes::new(), 10_000_000, U256::ZERO)).unwrap();
         let result = executed.discard();
         assert!(result.status, "test call failed: {result:?}");
         (result.output, *evm.clear_inspector_as::<Cheats>().unwrap())
@@ -895,12 +897,19 @@ fn new_evm<'a>(db: impl DynDatabase + 'a) -> Evm<'a, BaseEvmTypes> {
     )
 }
 
-fn legacy_tx(caller: Address, to: Address, input: Bytes, gas_limit: u64) -> Recovered<TxEnvelope> {
+fn legacy_tx(
+    caller: Address,
+    to: Address,
+    input: Bytes,
+    gas_limit: u64,
+    value: U256,
+) -> Recovered<TxEnvelope> {
     Recovered::new_unchecked(
         TxEnvelope::Legacy(TxLegacy {
             to: TxKind::Call(to),
             input,
             gas_limit,
+            value,
             ..Default::default()
         }),
         caller,
@@ -1686,7 +1695,7 @@ fn measure_per_call_evm_construction_and_cache_move() {
         let call = time(ITERS, || {
             let mut evm = new_evm(EmptyDB::default());
             *evm.state_mut() = saved.take().unwrap().load(backing.clone());
-            let tx = legacy_tx(CALLER, COUNTER, Bytes::new(), 100_000);
+            let tx = legacy_tx(CALLER, COUNTER, Bytes::new(), 100_000, U256::ZERO);
             assert!(evm.transact(&tx).unwrap().commit().status);
             let state = mem::replace(evm.state_mut(), State::new(EmptyDB::default()));
             saved = Some(SavedState::save(state));
