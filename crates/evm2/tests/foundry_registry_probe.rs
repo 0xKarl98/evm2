@@ -22,7 +22,7 @@ use evm2::{
     ethereum::{TxEnvelope, ethereum_tx_registry, intrinsic_gas},
     evm::{
         AccountInfo, Cache, DbResult, DynDatabase, EmptyDB, PendingState, State, StateCheckpoint,
-        StateSnapshot, TxResult,
+        StateSnapshot, SystemTx, TxResult,
     },
     interpreter::{GasTracker, InstrStop, Interpreter, Message, MessageKind, MessageResult, Word, op},
 };
@@ -55,6 +55,8 @@ const NESTED: Address = Address::with_last_byte(0x4b);
 const FAILING: Address = Address::with_last_byte(0x4c);
 /// Emits its calldata as a log, like an event or a `console.log` in a test.
 const LOGGER: Address = Address::with_last_byte(0x10);
+/// Creates a contract whose initcode writes its slot 0 and self-destructs.
+const FACTORY: Address = Address::with_last_byte(0xfa);
 
 /// `selectFork(arg)`.
 const SELECT_FORK: u8 = 1;
@@ -160,17 +162,24 @@ impl SavedState {
         state
     }
 
-    /// Accepts the transaction layer into the overlay at the end of a committed transaction, then
-    /// clears per-transaction substate.
+    /// Finalizes and accepts the transaction layer into the overlay at the end of a committed
+    /// transaction, then clears per-transaction substate.
     ///
     /// The writes can't stay pending in the transaction layer: the next transaction needs each
     /// original reset to its start value, and a commit only accepts entries that differ from their
     /// original, so a write that isn't repeated after the fork is reselected would be lost.
+    ///
+    /// Committing alone would skip finalization, which turns self-destructs and touches into
+    /// account deletions and storage wipes. `Evm::transact` finalizes only the active fork, so a
+    /// system call runs evm2's own finalization here. It doesn't bump a nonce or charge a fee, and
+    /// its zero-value call touches only [`CHEATS`], which exists with code on every fork, so it
+    /// changes nothing else. Finalization waits for the commit because the transaction may select
+    /// the fork again and use the accounts until it ends.
     fn accept_transaction(self) -> Self {
-        let mut state = self.load(EmptyDB::default());
-        state.commit_transaction();
-        state.clear_transaction_state();
-        Self::save(state)
+        let mut evm = new_evm(EmptyDB::default());
+        *evm.state_mut() = self.load(EmptyDB::default());
+        assert!(evm.system_call(SystemTx::new(CHEATS, Bytes::new())).unwrap().commit().status);
+        Self::save(mem::replace(evm.state_mut(), State::new(EmptyDB::default())))
     }
 
     /// Reads a slot through the transaction layer, the overlay, then `db`.
@@ -184,6 +193,11 @@ impl SavedState {
         let rest = state.snapshot();
         state.overlay_db_mut().cache = cache;
         rest
+    }
+
+    /// Reads an account through the transaction layer, the overlay, then `db`.
+    fn account(&self, db: BackingDb, address: Address) -> Option<AccountInfo> {
+        self.clone().load(db).account_info_untracked(&address).unwrap()
     }
 }
 
@@ -766,9 +780,17 @@ struct Executor {
 
 impl Executor {
     fn new(backings: Vec<BackingDb>) -> Self {
+        // Like Foundry's cheatcode account, which has code `0x00` and, as a default persistent
+        // account, exists on every fork.
+        let cheats =
+            AccountInfo::default().with_code(Bytecode::new_legacy(Bytes::from_static(&[op::STOP])));
         let forks = backings
             .into_iter()
-            .map(|backing| ForkEntry { backing, saved: Some(SavedState::default()) })
+            .map(|backing| {
+                let mut state = State::new(EmptyDB::default());
+                state.overlay_db_mut().insert_account_info(&CHEATS, cheats.clone());
+                ForkEntry { backing, saved: Some(SavedState::save(state)) }
+            })
             .collect();
         let mut registry = Registry { forks, ..Default::default() };
         registry.persistent.extend([CALLER, TEST]);
@@ -817,7 +839,8 @@ impl Executor {
 
     fn finish(&mut self, cheats: Cheats, state: State<'_>) {
         let mut registry = cheats.registry;
-        // `ExecutedTx::commit` only accepted the active fork; accept the inactive ones too.
+        // `ExecutedTx::commit` only finalized and accepted the active fork; do the inactive ones
+        // too.
         for fork in &mut Arc::make_mut(&mut registry).forks {
             fork.saved = fork.saved.take().map(SavedState::accept_transaction);
         }
@@ -858,22 +881,27 @@ impl Executor {
 
     /// Reads a slot of `fork` the way executor helpers do: through the overlay and saved caches.
     fn storage(&self, fork: usize, address: Address, key: Word) -> Word {
-        let saved = if fork == self.registry.active {
-            self.active.as_ref()
-        } else {
-            self.registry.forks[fork].saved.as_ref()
-        };
-        saved.unwrap().storage(self.registry.backing(fork), address, key)
+        self.saved(fork).storage(self.registry.backing(fork), address, key)
     }
 
     /// The accepted overlay's cached value of a slot, if any.
     fn accepted(&self, fork: usize, address: Address, key: Word) -> Option<Word> {
+        self.saved(fork).cache.storage.get(&address)?.slots.get(&key).copied()
+    }
+
+    /// Reads an account of `fork` like [`Self::storage`].
+    fn account(&self, fork: usize, address: Address) -> Option<AccountInfo> {
+        self.saved(fork).account(self.registry.backing(fork), address)
+    }
+
+    /// The saved state of `fork`, which is [`Self::active`] for the active fork.
+    fn saved(&self, fork: usize) -> &SavedState {
         let saved = if fork == self.registry.active {
             self.active.as_ref()
         } else {
             self.registry.forks[fork].saved.as_ref()
         };
-        saved.unwrap().cache.storage.get(&address)?.slots.get(&key).copied()
+        saved.unwrap()
     }
 }
 
@@ -963,6 +991,19 @@ fn logger_code() -> Bytecode {
         op::LOG0,
         op::STOP,
     ]))
+}
+
+/// Code that creates a contract whose initcode writes its slot 0 = 1 and self-destructs to the
+/// creator.
+fn factory_code() -> Bytecode {
+    let init = [op::PUSH1, 1, op::PUSH0, op::SSTORE, op::CALLER, op::SELFDESTRUCT];
+    let mut code = vec![op::PUSH6];
+    code.extend_from_slice(&init);
+    code.extend([op::PUSH0, op::MSTORE]);
+    // CREATE(value, offset, size) of the initcode, right-aligned in the first memory word.
+    code.extend([op::PUSH1, init.len() as u8, op::PUSH1, 32 - init.len() as u8, op::PUSH0]);
+    code.extend([op::CREATE, op::POP, op::STOP]);
+    Bytecode::new_legacy(code.into())
 }
 
 /// Code that performs `calls` in order and ignores their results.
@@ -2009,4 +2050,24 @@ fn reverted_calls_drop_only_their_logs() {
     ]);
     let script = [emit(1), (CHEATS, &[SNAPSHOT][..]), (HANDLER, &[]), emit(6)];
     assert_eq!(logs_after(&mut executor, script_code(&script), true), [1, 2, 5, 6]);
+}
+
+/// A contract created and self-destructed in one transaction is deleted under EIP-6780, also when
+/// its fork is inactive at commit. Committing the fork's transaction layer without finalizing it
+/// would keep the account with nonce 1 and slot 0 = 1. [`HANDLER`] creates it and leaves the fork
+/// in one call: an isolated child finalizes only the fork it ends on, so in isolated mode the
+/// created fork is inactive at commit only when the child itself leaves it.
+#[test]
+fn create_and_selfdestruct_on_fork_inactive_at_commit() {
+    let child = FACTORY.create(0);
+    for isolate in [false, true] {
+        let mut executor = executor_with(&[
+            (FACTORY, factory_code()),
+            (HANDLER, script_code(&[(FACTORY, &[]), select(1)])),
+        ]);
+        executor.isolate = isolate;
+        executor.run(&[(HANDLER, &[])]);
+        assert_eq!(executor.account(0, child), None, "isolate: {isolate}");
+        assert_eq!(executor.storage(0, child, Word::ZERO), Word::ZERO, "isolate: {isolate}");
+    }
 }
